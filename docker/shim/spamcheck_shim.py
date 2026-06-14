@@ -69,6 +69,23 @@ PYZOR = os.environ.get("PYZOR", "pyzor")
 # (~330ms) because it rebuilds its Razor2 agent per connection. Left as opt-in.
 RAZORD_ADDR = os.environ.get("SHIM_RAZORD_ADDR", "").strip()
 
+# Verbose logging: per-request access line + verdict/timing/cache detail. Off by
+# default (only startup + errors logged); toggle with SHIM_VERBOSE=1 in compose.
+VERBOSE = os.environ.get("SHIM_VERBOSE", "").lower() in ("1", "true", "yes", "on")
+
+
+def _log(msg):
+    """Always logged (startup, errors)."""
+    import sys
+    sys.stderr.write("[shim] " + msg + "\n")
+    sys.stderr.flush()
+
+
+def _vlog(msg):
+    """Logged only when SHIM_VERBOSE is on."""
+    if VERBOSE:
+        _log(msg)
+
 # Explicit homedirs: the shim runs as `drp`, whose $HOME is not the state dir, so
 # the CLIs must be told where their identity/servers live (env RAZORHOME works
 # for razor, but pyzor needs --homedir).
@@ -158,8 +175,7 @@ def _make_cache():
         try:
             return _RedisCache(REDIS_URL)
         except Exception as e:
-            import sys
-            sys.stderr.write(f"[shim] Redis cache init failed ({e}); using in-memory\n")
+            _log(f"Redis cache init failed ({e}); using in-memory")
     return _MemoryCache()
 
 
@@ -361,6 +377,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": "bad length"}))
             return
         msg = self.rfile.read(length)
+        t0 = time.time()
 
         # /check is cacheable (idempotent query); /report|/revoke are not.
         cache_key = None
@@ -374,18 +391,27 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(hit)))
                 self.end_headers()
                 self.wfile.write(hit if isinstance(hit, bytes) else hit.encode())
+                _vlog(f"{self.path} {length}B cache=hit "
+                      f"{(time.time()-t0)*1000:.1f}ms -> {hit.decode() if isinstance(hit, bytes) else hit}")
                 return
 
         if not _sem.acquire(timeout=TIMEOUT):
             self._send(503, json.dumps({"error": "busy"}))
+            _log(f"{self.path} 503 busy (max_concurrent={MAX_CONCURRENT} reached)")
             return
         try:
             body = json.dumps(handler(msg))
             if cache_key is not None:
                 _cache_put(cache_key, body)
             self._send(200, body)
+            ms = (time.time() - t0) * 1000
+            if self.path == "/check":
+                _vlog(f"/check {length}B cache=miss {ms:.1f}ms -> {body}")  # high volume
+            else:
+                # /report + /revoke: rare feedback actions — always logged (audit trail)
+                _log(f"{self.path} {length}B {ms:.1f}ms -> {body}")
         except Exception as e:  # never 500 the caller; log and return safe defaults
-            self.log_error("%s failed: %s", self.path, e)
+            _log(f"{self.path} backend error: {e}")
             if self.path == "/check":
                 self._send(200, json.dumps({
                     "dcc": {"action": "unknown", "bulk": None},
@@ -397,23 +423,20 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             _sem.release()
 
-    def log_message(self, fmt, *args):  # to stderr -> s6 captures it
-        import sys
-        sys.stderr.write("[shim] " + (fmt % args) + "\n")
+    def log_message(self, fmt, *args):  # http.server access log — verbose only
+        _vlog(fmt % args)
 
 
 def main():
     if not TOKEN:
-        import sys
-        sys.stderr.write(
-            "[shim] WARNING: no SHIM_TOKEN configured — POST endpoints will "
-            "refuse all requests (503). Set SHIM_TOKEN or SHIM_TOKEN_FILE.\n")
+        _log("WARNING: no SHIM_TOKEN configured — POST endpoints will refuse all "
+             "requests (503). Set SHIM_TOKEN or SHIM_TOKEN_FILE.")
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     cache = "off" if CACHE_TTL <= 0 else ("redis" if REDIS_URL else "memory")
-    print(f"[shim] listening on {HOST}:{PORT} "
-          f"(timeout={TIMEOUT}s, max_concurrent={MAX_CONCURRENT}, "
-          f"cache={cache} ttl={CACHE_TTL}s, razord={RAZORD_ADDR or 'off(CLI)'}, "
-          f"auth={'on' if TOKEN else 'OFF'})", flush=True)
+    _log(f"listening on {HOST}:{PORT} "
+         f"(timeout={TIMEOUT}s, max_concurrent={MAX_CONCURRENT}, "
+         f"cache={cache} ttl={CACHE_TTL}s, razord={RAZORD_ADDR or 'off(CLI)'}, "
+         f"verbose={'on' if VERBOSE else 'off'}, auth={'on' if TOKEN else 'OFF'})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

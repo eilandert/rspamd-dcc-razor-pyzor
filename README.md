@@ -150,6 +150,7 @@ All settings are environment variables on the backend container:
 | `SHIM_REDIS_PREFIX` | `drp:check:` | Key prefix in Redis. |
 | `SHIM_MAX_CONCURRENT` | `8` | Max in-flight requests (bounds CLI fork-out). |
 | `SHIM_BACKEND_TIMEOUT` | `6` | Per-CLI timeout in seconds. |
+| `SHIM_VERBOSE` | `0` (off) | Per-request logging — access line plus verdict, timing and cache hit/miss. Off by default (only startup and errors are logged). |
 | `SHIM_RAZORD_ADDR` | — (off) | Optional persistent Razor daemon (razorfy) at `host:port`. **Off by default** — benchmarks showed it ~4× slower than the `razor-check` CLI, so the CLI is used unless you set this. |
 | `TZ` | — | Container timezone. |
 

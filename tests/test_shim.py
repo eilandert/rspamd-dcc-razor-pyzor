@@ -273,6 +273,20 @@ def test_redis_cache_roundtrip_and_graceful():
     assert rc.get("k2") is None                   # redis broken -> graceful miss
 
 
+def test_vlog_respects_verbose(monkeypatch, capsys):
+    monkeypatch.setattr(shim, "VERBOSE", False)
+    shim._vlog("quiet")
+    assert "quiet" not in capsys.readouterr().err
+    monkeypatch.setattr(shim, "VERBOSE", True)
+    shim._vlog("loud")
+    assert "loud" in capsys.readouterr().err
+
+
+def test_log_always_writes(capsys):
+    shim._log("always")
+    assert "always" in capsys.readouterr().err
+
+
 def test_fail_closed_when_no_token(monkeypatch):
     monkeypatch.setattr(shim, "_run", _stub(1))
     monkeypatch.setattr(shim, "TOKEN", "")
