@@ -37,6 +37,20 @@ healthcheck only requires the shim's `/health`.
 endpoints, read-only rootfs + `cap_drop: ALL` + `no-new-privileges` (compose),
 not published to the host.
 
+### The message never touches local disk
+
+The body is held in memory by the shim and piped to `dccproc` / `razor-check` /
+`pyzor` over **stdin** — no temp file is written. The cache stores only
+`sha256(body)` → verdict (never the body), and the same for the optional Redis
+backend, so no message content is persisted locally. This is why a `tmpfs`
+overlay buys nothing here: there is no per-message disk write to accelerate, and
+the latency is **network** round-trips to the DCC/Razor/Pyzor servers, not disk.
+
+What does leave the container is what collaborative filtering requires:
+**content fingerprints** — DCC checksums, Razor signatures, Pyzor digests — sent
+to those networks (and, on `/report`, submitted as a spam report). The raw
+message is never uploaded.
+
 ## 1. Run the backend
 
 The shim refuses every POST (503) until a token is set, and is reachable only on
