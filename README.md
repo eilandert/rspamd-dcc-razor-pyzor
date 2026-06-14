@@ -1,59 +1,82 @@
 # rspamd-dcc-razor-pyzor
 
-An [rspamd](https://rspamd.com) plugin **and** a self-contained Debian Docker
-image that scores mail against the three classic collaborative-filtering
-networks — **DCC**, **Razor** and **Pyzor** — through one local HTTP shim.
+A **standalone Docker backend** that exposes the three classic
+collaborative-filtering networks — **DCC**, **Razor** and **Pyzor** — over one
+HTTP endpoint, plus the [rspamd](https://rspamd.com) plugin that queries it.
 
-rspamd ships a native DCC module but has no native Razor or Pyzor support, and
-running those CLIs inside the worker would block its event loop. This project
-solves both: a small async Lua plugin talks to an out-of-process HTTP shim that
-runs the CLIs, so all three networks are covered in a single async round-trip.
+The image runs **no rspamd**. rspamd lives in its own container (or host); you
+install the plugin shipped here into that rspamd and point it at this backend.
 
-## What's in the box
+Why: rspamd ships a native DCC module but has no native Razor or Pyzor support,
+and running those CLIs inside the rspamd worker would block its event loop. This
+backend runs the CLIs out-of-process and answers over HTTP, so the plugin stays
+fully async and one round-trip covers all three networks.
 
-| Component | Role | Supervised by |
-|-----------|------|---------------|
-| `rspamd/plugins/dcc_razor_pyzor.lua` | async plugin; POSTs the message to the shim, maps each network to its own symbol | rspamd |
-| `shim/spamcheck_shim.py` | stdlib HTTP wrapper around `dccproc` / `razor-check` / `pyzor` | s6 (`shim`) |
-| `dccifd` | DCC interface daemon the shim queries | s6 (`dccifd`) |
-| `rspamd` | the scanner | s6 (`rspamd`) |
+## Architecture
 
-Symbols (scores in `rspamd/local.d/groups.conf`, tune to taste):
+```
+  ┌──────────────────────┐        HTTP :8077        ┌────────────────────────────┐
+  │  rspamd (your image)  │ ───────────────────────► │  rspamd-dcc-razor-pyzor     │
+  │  dcc_razor_pyzor.lua  │   POST /check (message)  │  spamcheck_shim (s6)        │
+  └──────────────────────┘ ◄─────────────────────── │   ├─ dccproc → dccifd (s6)  │
+                              JSON verdict           │   ├─ razor-check            │
+                                                     │   └─ pyzor check            │
+                                                     └────────────────────────────┘
+```
 
-- `DRP_DCC_BULK` — DCC reports the body as bulk
-- `DRP_RAZOR` — Razor signature match
-- `DRP_PYZOR` — Pyzor sightings above threshold
+This image (s6-overlay supervised):
+- `shim` longrun — `spamcheck_shim.py`, HTTP on `:8077`, wraps the CLIs.
+- `dccifd` longrun — DCC interface daemon the shim's `dccproc` uses.
+- `init-bootstrap` oneshot — DCC map / Razor identity / Pyzor servers setup.
 
 Each backend is **best-effort**: a dead network degrades scoring, never
-availability. The container healthcheck only requires rspamd + the shim.
+availability. The container healthcheck only requires the shim's `/health`.
 
-## Run
+## 1. Run the backend
 
 ```bash
 docker run -d --name rspamd-drp \
-  -p 11332:11332 -p 11334:11334 \
-  -v rspamd-data:/var/lib/rspamd \
+  -p 8077:8077 \
+  -v drp-razor:/var/lib/razor -v drp-pyzor:/var/lib/pyzor -v drp-dcc:/var/dcc \
   eilandert/rspamd-dcc-razor-pyzor:latest
 ```
 
 or `docker compose up -d` (see [docker-compose.yml](docker-compose.yml)).
 
-Wire it into your MTA the same way as any rspamd proxy/milter (port 11332);
-the controller/web UI is on 11334.
+Keep `:8077` on a private network — it accepts raw messages and has no auth.
 
-## Use the plugin only (existing rspamd)
+## 2. Install the plugin into your rspamd
 
-You don't need the image. Drop the plugin into an existing rspamd and point it
-at a running shim:
-
-```
+```bash
 cp rspamd/plugins/dcc_razor_pyzor.lua /etc/rspamd/plugins/
 cp rspamd/local.d/dcc_razor_pyzor.conf /etc/rspamd/local.d/
-cp rspamd/local.d/groups.conf          /etc/rspamd/local.d/
+cp rspamd/local.d/groups.conf          /etc/rspamd/local.d/   # symbol scores
 echo 'dofile("/etc/rspamd/plugins/dcc_razor_pyzor.lua")' >> /etc/rspamd/rspamd.local.lua
-# run the shim somewhere reachable; set `url` in the .conf accordingly
-python3 shim/spamcheck_shim.py
 ```
+
+Point the plugin at the backend in `local.d/dcc_razor_pyzor.conf`:
+
+```
+url = "http://rspamd-drp:8077/check";   # backend container/host:port
+```
+
+Restart rspamd. Symbols (scores in `groups.conf`, tune to taste):
+
+- `DRP_DCC_BULK` — DCC reports the body as bulk
+- `DRP_RAZOR` — Razor signature match
+- `DRP_PYZOR` — Pyzor sightings above threshold
+
+## HTTP API
+
+`POST /check` with the raw RFC-822 message as the body → JSON:
+
+```json
+{ "dcc":   { "action": "reject", "bulk": 2147483647 },
+  "razor": { "hit": true },
+  "pyzor": { "count": 42, "wl": 0 } }
+```
+
+`GET /health` → `200 ok` (used by the container HEALTHCHECK).
 
 ## Build
 
@@ -62,7 +85,8 @@ docker build -f Dockerfile-deb -t eilandert/rspamd-dcc-razor-pyzor:latest .
 ```
 
 In the [dockerized](https://github.com/eilandert/dockerized) monorepo this
-builds via buildx-bake targets `debian-rspamd-drp` / `ubuntu-rspamd-drp`.
+builds via the buildx-bake target `debian-rspamd-drp` (external context
+`../rspamd-dcc-razor-pyzor`, same pattern as `../webtester`).
 
 > **DCC note:** DCC has no Debian package (licence terms), so it is compiled
 > from the upstream source tarball during the image build. If your build host

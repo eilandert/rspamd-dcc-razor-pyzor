@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
-# rspamd + DCC/Razor/Pyzor collaborative filters, supervised by s6-overlay.
-#   * rspamd            — the scanner (loads dcc_razor_pyzor.lua)
-#   * spamcheck_shim    — HTTP wrapper around the three CLIs (s6 longrun)
+# Standalone DCC/Razor/Pyzor backend for rspamd, supervised by s6-overlay.
+# This image runs NO rspamd. It exposes one HTTP endpoint (:8077) that rspamd's
+# dcc_razor_pyzor.lua plugin (shipped in this repo, installed into a SEPARATE
+# rspamd container) queries over the network.
+#   * spamcheck_shim    — HTTP wrapper around the three CLIs (s6 longrun, :8077)
 #   * dccifd            — DCC interface daemon (s6 longrun)
 #   * razor / pyzor     — per-message CLIs invoked by the shim
 FROM eilandert/debian-base:stable
@@ -10,7 +12,6 @@ LABEL org.opencontainers.image.source="https://github.com/eilandert/rspamd-dcc-r
 LABEL maintainer="Thijs Eilander <eilander@myguard.nl>"
 
 ENV DEBIAN_FRONTEND="noninteractive" \
-    DIST=trixie \
     RAZORHOME=/var/lib/razor \
     PYZOR_HOME=/var/lib/pyzor \
     S6_KEEP_ENV=1 \
@@ -27,12 +28,7 @@ ARG DCC_VERSION=2.3.168
 RUN set -ex; \
     apt-get -y update; \
     apt-get --no-install-recommends -y install ca-certificates curl xz-utils; \
-    # rspamd apt repo (same source the rspamd-git image uses)
-    echo "deb [arch=amd64 trusted=yes] http://rspamd.com/apt-stable/ $DIST main" \
-      > /etc/apt/sources.list.d/rspamd.list; \
-    apt-get -y update; \
     apt-get --no-install-recommends -y install \
-      rspamd \
       python3 \
       pyzor \
       gcc make libc6-dev; \
@@ -54,18 +50,15 @@ RUN set -ex; \
     make install; \
     cd /; rm -rf /tmp/dcc*; \
     chown -R dcc:dcc /var/dcc; \
-    # rspamd container defaults (console logging, controller bind, no pidfile)
-    mkdir -p /etc/rspamd/override.d; \
-    mv /etc/rspamd /etc/rspamd.orig; \
-    mkdir -p /etc/rspamd /var/log/rspamd /var/lib/rspamd /var/run/rspamd \
-             "${RAZORHOME}" "${PYZOR_HOME}"; \
+    mkdir -p "${RAZORHOME}" "${PYZOR_HOME}"; \
     # drop build toolchain to keep the image lean
     apt-get -y purge gcc make libc6-dev; \
     apt-get -y autoremove; \
     apt-get -y clean autoclean; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt /usr/local/share/man
 
-# Project payload (plugin + shim + s6 service tree).
+# Project payload (shim + s6 service tree). The rspamd/ plugin + configs are
+# shipped too (under /opt/drp/rspamd) for installation into an external rspamd.
 COPY rspamd/ /opt/drp/rspamd/
 COPY shim/   /opt/drp/shim/
 COPY root/   /
@@ -75,12 +68,10 @@ RUN set -ex; \
     chmod 0755 /opt/drp/shim/spamcheck_shim.py \
                /etc/s6-overlay/scripts/init-bootstrap.sh \
                /etc/s6-overlay/s6-rc.d/dccifd/run \
-               /etc/s6-overlay/s6-rc.d/shim/run \
-               /etc/s6-overlay/s6-rc.d/rspamd/run
+               /etc/s6-overlay/s6-rc.d/shim/run
 
-VOLUME [ "/var/lib/rspamd" ]
-# rspamd: 11332 normal, 11333 controller (legacy), 11334 controller/web
-EXPOSE 11332 11333 11334
+# spamcheck shim HTTP endpoint queried by the external rspamd plugin.
+EXPOSE 8077
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD /healthcheck.sh || exit 1

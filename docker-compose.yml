@@ -6,12 +6,11 @@ services:
     environment:
       TZ: Europe/Amsterdam
     ports:
-      - "11332:11332"   # normal worker (milter/proxy)
-      - "11334:11334"   # controller / web UI
+      - "8077:8077"     # spamcheck shim — queried by the external rspamd plugin
     volumes:
-      - rspamd-data:/var/lib/rspamd
-      # Optional: override config / plugin tuning
-      # - ./rspamd/local.d:/etc/rspamd/local.d:ro
+      - drp-razor:/var/lib/razor
+      - drp-pyzor:/var/lib/pyzor
+      - drp-dcc:/var/dcc
     healthcheck:
       test: ["CMD", "/healthcheck.sh"]
       interval: 30s
@@ -20,4 +19,6 @@ services:
       retries: 3
 
 volumes:
-  rspamd-data:
+  drp-razor:
+  drp-pyzor:
+  drp-dcc:
