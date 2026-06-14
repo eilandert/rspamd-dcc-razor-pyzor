@@ -1,18 +1,21 @@
 # rspamd-dcc-razor-pyzor
 
-A **standalone Docker backend** that exposes the three classic
-collaborative-filtering networks — **DCC**, **Razor** and **Pyzor** — over one
-HTTP endpoint, plus the [rspamd](https://rspamd.com) plugin that queries it.
+A small, standalone Docker backend that brings the three classic
+collaborative-filtering networks — **DCC**, **Razor** and **Pyzor** — to
+[rspamd](https://rspamd.com) through a single HTTP endpoint, plus the rspamd
+plugin that talks to it.
 
-The image runs **no rspamd**. rspamd lives in its own container (or host); you
-install the plugin shipped here into that rspamd and point it at this backend.
+The image runs **no rspamd of its own**. Your rspamd stays in its own container
+(or on the host); you drop the plugin shipped here into it and point the plugin
+at this backend.
 
-Why: rspamd ships a native DCC module but has no native Razor or Pyzor support,
-and running those CLIs inside the rspamd worker would block its event loop. This
-backend runs the CLIs out-of-process and answers over HTTP, so the plugin stays
-fully async and one round-trip covers all three networks.
+**Why a separate backend?** rspamd has a built-in DCC module but nothing for
+Razor or Pyzor, and shelling out to those CLIs from inside the rspamd worker
+would block its event loop. This service runs the CLIs out-of-process and
+answers over HTTP, so the plugin stays fully asynchronous and a single request
+covers all three networks at once.
 
-## Architecture
+## How it works
 
 ```
   ┌──────────────────────┐   HTTP :8077 + token   ┌────────────────────────────┐
@@ -24,61 +27,101 @@ fully async and one round-trip covers all three networks.
                                                    └────────────────────────────┘
 ```
 
-This image (s6-overlay supervised):
-- `shim` longrun — `spamcheck_shim.py`, HTTP on `:8077`, runs as the
-  unprivileged **drp** user, queries the CLIs concurrently.
-- `init-bootstrap` oneshot — DCC map / Razor identity / Pyzor servers setup.
+Inside the image (supervised by s6-overlay):
 
-dccproc contacts the DCC servers directly (no dccifd daemon). Each backend is
-**best-effort**: a dead network degrades scoring, never availability. The
-healthcheck only requires the shim's `/health`.
+- **`shim`** — `spamcheck_shim.py`, an HTTP server on `:8077` running as the
+  unprivileged `drp` user. It queries the three CLIs **concurrently** and caches
+  verdicts (see [Configuration](#configuration)).
+- **`init-bootstrap`** — one-shot setup of the DCC map, Razor identity and Pyzor
+  server list.
 
-**Hardening:** non-root shim, bounded concurrency, **token-authenticated** POST
-endpoints, read-only rootfs + `cap_drop: ALL` + `no-new-privileges` (compose),
-not published to the host.
+`dccproc` talks to the DCC servers directly (no `dccifd` daemon needed). Every
+backend is **best-effort**: if one network is unreachable it simply doesn't
+score, and the container stays healthy — the healthcheck only depends on the
+shim's `/health`.
 
-### The message never touches local disk
+**Hardening:** the shim runs non-root with bounded concurrency, every POST is
+**token-authenticated**, and the bundled compose runs the container read-only
+with `cap_drop: ALL`, `no-new-privileges`, and no published host port.
 
-The body is held in memory by the shim and piped to `dccproc` / `razor-check` /
-`pyzor` over **stdin** — no temp file is written. The cache stores only
-`sha256(body)` → verdict (never the body), and the same for the optional Redis
-backend, so no message content is persisted locally. This is why a `tmpfs`
-overlay buys nothing here: there is no per-message disk write to accelerate, and
-the latency is **network** round-trips to the DCC/Razor/Pyzor servers, not disk.
+### Privacy: the message never touches disk
 
-What does leave the container is what collaborative filtering requires:
+The shim keeps the message in memory and feeds it to `dccproc` / `razor-check` /
+`pyzor` over **stdin** — nothing is written to a temp file. The cache stores only
+`sha256(body) → verdict` (never the body itself), and the same goes for the
+optional Redis backend, so no message content is ever persisted locally.
+
+(This is also why a `tmpfs` overlay would do nothing for speed: there is no
+per-message disk write to accelerate. The latency is **network** round-trips to
+the DCC/Razor/Pyzor servers.)
+
+The only thing that leaves the container is what collaborative filtering needs:
 **content fingerprints** — DCC checksums, Razor signatures, Pyzor digests — sent
-to those networks (and, on `/report`, submitted as a spam report). The raw
-message is never uploaded.
+to those networks (and, on `/report`, a spam submission). The raw message is
+never uploaded.
 
-## 1. Run the backend
+## Quick start
 
-The shim refuses every POST (503) until a token is set, and is reachable only on
-the docker network — so use compose:
+### 1. Run the backend
+
+The shim rejects every POST until a token is configured, and it isn't published
+to the host — so run it with compose:
 
 ```bash
 cd docker
 mkdir -p secrets && openssl rand -hex 32 > secrets/drp_token.txt
-docker compose up -d        # see docker/docker-compose.yml
+docker compose up -d        # docker/docker-compose.yml
 ```
 
-The backend is then reachable from containers on the same docker network as
-`http://rspamd-drp:8077` (no host port). Put the same token on the clients.
+Containers on the same Docker network now reach it at `http://rspamd-drp:8077`.
+Give your rspamd (and Dovecot) the same token.
+
+### 2. Install the plugin into rspamd
+
+The plugin lives in [`rspamd/`](rspamd/) at the repo root (it is **not** baked
+into the backend image):
+
+```bash
+cp rspamd/plugins/dcc_razor_pyzor.lua  /etc/rspamd/plugins/
+cp rspamd/local.d/dcc_razor_pyzor.conf /etc/rspamd/local.d/
+cp rspamd/local.d/groups.conf          /etc/rspamd/local.d/   # symbol scores
+echo 'dofile("/etc/rspamd/plugins/dcc_razor_pyzor.lua")' >> /etc/rspamd/rspamd.local.lua
+```
+
+Then set the backend URL and the **same token** in `local.d/dcc_razor_pyzor.conf`:
+
+```
+url   = "http://rspamd-drp:8077/check";   # backend host:port
+token = "the-shared-secret";              # must equal the shim's SHIM_TOKEN
+```
+
+> **Heads-up on DNS:** rspamd resolves URLs through its own configured resolver.
+> If that resolver can't see Docker service names (for example an RBL-only
+> unbound), use the backend's **IP address** in `url` instead of `rspamd-drp`.
+
+Restart rspamd. The plugin adds three symbols, scored in `groups.conf` (tune to
+taste):
+
+| Symbol | Meaning |
+|--------|---------|
+| `DRP_DCC_BULK` | DCC reports the body as bulk |
+| `DRP_RAZOR` | Razor signature match |
+| `DRP_PYZOR` | Pyzor sightings above threshold |
 
 ## Identities
 
-Each network has an identity that is auto-created on first boot and persisted in
-the named volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
+Each network has an identity, auto-created on first boot and kept in the named
+volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
 
 | Network | Identity | Anonymous default |
 |---------|----------|-------------------|
 | Razor | account registered via `razor-admin` | yes (random identity) |
 | DCC | client-id in `/var/dcc/ids` | yes (anonymous id) |
-| Pyzor | optional accounts file | yes (anonymous to public server) |
+| Pyzor | optional accounts file | yes (anonymous to the public server) |
 
-Anonymous is fine for most setups. To use a **known/shared identity** — so it
-survives a volume reset or is reused across instances — supply it via the
-environment (see [docker/docker-compose.yml](docker/docker-compose.yml)):
+Anonymous is fine for most setups. To use a **known or shared identity** — one
+that survives a volume reset or is reused across instances — provide it through
+the environment (see [`docker/docker-compose.yml`](docker/docker-compose.yml)):
 
 ```yaml
 environment:
@@ -89,41 +132,34 @@ environment:
   PYZOR_SERVERS: "public.pyzor.org:24441"
 ```
 
-Precedence per network: **explicit env > existing file in the volume >
-anonymous**. Every credential var also accepts a `<VAR>_FILE` form (Docker
-secrets) — e.g. `RAZOR_REGISTER_PASS_FILE=/run/secrets/razor_pass` — so secrets
-never have to sit in the compose file.
+Resolution order per network: **explicit env → existing file in the volume →
+anonymous**. Every credential variable also accepts a `<VAR>_FILE` form for
+Docker secrets — e.g. `RAZOR_REGISTER_PASS_FILE=/run/secrets/razor_pass` — so a
+secret never has to sit in the compose file.
 
-## 2. Install the plugin into your rspamd
+## Configuration
 
-```bash
-cp rspamd/plugins/dcc_razor_pyzor.lua /etc/rspamd/plugins/
-cp rspamd/local.d/dcc_razor_pyzor.conf /etc/rspamd/local.d/
-cp rspamd/local.d/groups.conf          /etc/rspamd/local.d/   # symbol scores
-echo 'dofile("/etc/rspamd/plugins/dcc_razor_pyzor.lua")' >> /etc/rspamd/rspamd.local.lua
-```
+All settings are environment variables on the backend container:
 
-Point the plugin at the backend and set the **same token** in
-`local.d/dcc_razor_pyzor.conf`:
-
-```
-url   = "http://rspamd-drp:8077/check";   # backend container/host:port
-token = "the-shared-secret";              # must equal the shim's SHIM_TOKEN
-```
-
-Restart rspamd. Symbols (scores in `groups.conf`, tune to taste):
-
-- `DRP_DCC_BULK` — DCC reports the body as bulk
-- `DRP_RAZOR` — Razor signature match
-- `DRP_PYZOR` — Pyzor sightings above threshold
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SHIM_TOKEN` / `SHIM_TOKEN_FILE` | — | Shared secret for POST auth. **Required** — without it every POST returns 503. |
+| `SHIM_CACHE_TTL` | `300` | Verdict cache lifetime in seconds (`0` disables). Bulk mail repeats, so cache hits are the main speed-up. |
+| `SHIM_CACHE_SIZE` | `4096` | In-memory cache entries (LRU). |
+| `SHIM_REDIS_URL` | — | Use Redis for the cache so **multiple scanners share** it, e.g. `redis://valkey:6379/5`. Otherwise the cache is in-process. |
+| `SHIM_REDIS_PREFIX` | `drp:check:` | Key prefix in Redis. |
+| `SHIM_MAX_CONCURRENT` | `8` | Max in-flight requests (bounds CLI fork-out). |
+| `SHIM_BACKEND_TIMEOUT` | `6` | Per-CLI timeout in seconds. |
+| `SHIM_RAZORD_ADDR` | — (off) | Optional persistent Razor daemon (razorfy) at `host:port`. **Off by default** — benchmarks showed it ~4× slower than the `razor-check` CLI, so the CLI is used unless you set this. |
+| `TZ` | — | Container timezone. |
 
 ## HTTP API
 
-Body is always the raw RFC-822 message. POST endpoints require the token, as
-`Authorization: Bearer <token>` or `X-DRP-Token: <token>` (401 if wrong, 503 if
-the shim has no token configured). `/health` needs no auth.
+The request body is always the raw RFC-822 message. POST endpoints require the
+token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
+(`401` if it's wrong, `503` if the shim has no token). `/health` needs no auth.
 
-- `POST /check` — **query only** (never reports), used by the rspamd plugin → JSON:
+- **`POST /check`** — query only, never reports. Used by the rspamd plugin.
 
   ```json
   { "dcc":   { "action": "reject", "bulk": 2147483647 },
@@ -131,47 +167,51 @@ the shim has no token configured). `/health` needs no auth.
     "pyzor": { "count": 42, "wl": 0 } }
   ```
 
-- `POST /report` — report the message as **spam** to all three networks → JSON:
+- **`POST /report`** — report the message as **spam** to all three networks.
 
   ```json
   { "dcc": true, "razor": true, "pyzor": true }
   ```
 
-- `POST /revoke` — report as **ham** (Razor/Pyzor; DCC has no network un-report,
-  returns `null`).
+- **`POST /revoke`** — report as **ham**. Razor and Pyzor support this; DCC has
+  no network un-report, so its value is `null`.
 
-- `GET /health` → `200 ok` (used by the container HEALTHCHECK).
+- **`GET /health`** — `200 ok`, used by the container healthcheck.
 
 ## Reporting from Dovecot (sieve)
 
-`/check` is for the scanner. `/report` and `/revoke` are for **feedback** — when
-a user drags a message to Junk (spam) or rescues one out of it (ham). Sieve can't
-do HTTP, so [dovecot/drp-report](dovecot/drp-report) (a tiny `curl` wrapper)
-bridges the message to the shim, driven by imapsieve.
+`/check` is for scanning. `/report` and `/revoke` are for **user feedback** —
+when someone moves a message into Junk (spam) or rescues it back out (ham).
+Sieve can't speak HTTP, so [`dovecot/drp-report`](dovecot/drp-report) bridges the
+message to the shim, triggered by imapsieve.
 
-On the **Dovecot host** (needs `curl` + `dovecot-sieve`):
+The [`eilandert/dovecot`](https://github.com/eilandert/dockerized) image already
+bakes this in. To wire it into **any other** Dovecot host (needs `curl` and
+`dovecot-sieve`):
 
-```
+```bash
 cp dovecot/drp-report              /usr/lib/dovecot/sieve-pipe/drp-report   # chmod 0755
 cp dovecot/sieve/report-spam.sieve /usr/lib/dovecot/sieve/
 cp dovecot/sieve/report-ham.sieve  /usr/lib/dovecot/sieve/
 sievec /usr/lib/dovecot/sieve/report-spam.sieve
 sievec /usr/lib/dovecot/sieve/report-ham.sieve
 cp dovecot/90-drp-sieve.conf       /etc/dovecot/conf.d/
-# backend URL + token (sieve_extprograms scrubs the env, so use the env file):
+
+# sieve_extprograms scrubs the environment, so pass the URL + token via a file:
 printf 'DRP_URL=http://rspamd-drp:8077\nDRP_TOKEN=the-shared-secret\n' \
   > /etc/dovecot/drp.env
+
 doveadm reload
 ```
 
-Behaviour ([90-drp-sieve.conf](dovecot/90-drp-sieve.conf)):
+What it does ([`90-drp-sieve.conf`](dovecot/90-drp-sieve.conf)):
 
-| User action (IMAP) | Sieve | Shim call |
-|--------------------|-------|-----------|
-| move/copy **into** `Junk` | report-spam.sieve | `POST /report` (spam) |
-| move **out of** `Junk` | report-ham.sieve | `POST /revoke` (ham) |
+| User action (IMAP) | Sieve script | Shim call |
+|--------------------|--------------|-----------|
+| move/copy **into** `Junk` | `report-spam.sieve` | `POST /report` (spam) |
+| move **out of** `Junk` | `report-ham.sieve` | `POST /revoke` (ham) |
 
-`drp-report` always exits 0 — a reporting failure never bounces mail or blocks
+`drp-report` always exits 0, so a reporting hiccup never bounces mail or blocks
 the IMAP move.
 
 ## Build
@@ -184,16 +224,16 @@ In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo
 is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 `docker buildx bake debian-rspamd-drp`.
 
-> **Packages:** `dcc`, `razor` and `pyzor` are installed from our own Debian
-> packages on [deb.myguard.nl](https://deb.myguard.nl) (the apt repo + signing
-> key ship in `eilandert/debian-base`). DCC isn't in Debian proper (licence
-> terms); the `dcc` package provides `dccifd`, `dccproc` and `cdcc`.
+> **Packages:** `dcc`, `razor` and `pyzor` come from our own Debian packages on
+> [deb.myguard.nl](https://deb.myguard.nl) (the apt repo and signing key are
+> already in `eilandert/debian-base`). DCC isn't in Debian proper for licence
+> reasons; the `dcc` package provides `dccifd`, `dccproc` and `cdcc`.
 
 ## See also
 
-- Docker Hub: https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor
-- Monorepo: https://github.com/eilandert/dockerized
-- Article: _(TODO: add deb.myguard.nl post link when published)_
+- Docker Hub: <https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor>
+- Monorepo: <https://github.com/eilandert/dockerized>
+- Article: _(TODO: add the deb.myguard.nl post link once published)_
 
 ## License
 
