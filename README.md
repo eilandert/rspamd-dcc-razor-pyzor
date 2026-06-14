@@ -15,35 +15,40 @@ fully async and one round-trip covers all three networks.
 ## Architecture
 
 ```
-  ┌──────────────────────┐        HTTP :8077        ┌────────────────────────────┐
-  │  rspamd (your image)  │ ───────────────────────► │  rspamd-dcc-razor-pyzor     │
-  │  dcc_razor_pyzor.lua  │   POST /check (message)  │  spamcheck_shim (s6)        │
-  └──────────────────────┘ ◄─────────────────────── │   ├─ dccproc → dccifd (s6)  │
-                              JSON verdict           │   ├─ razor-check            │
-                                                     │   └─ pyzor check            │
-                                                     └────────────────────────────┘
+  ┌──────────────────────┐   HTTP :8077 + token   ┌────────────────────────────┐
+  │  rspamd (your image)  │ ─────────────────────► │  rspamd-dcc-razor-pyzor     │
+  │  dcc_razor_pyzor.lua  │  POST /check (message) │  spamcheck_shim (s6, drp)   │
+  └──────────────────────┘ ◄───────────────────── │   ├─ dccproc (set-UID dcc)  │
+                              JSON verdict         │   ├─ razor-check            │
+                                                   │   └─ pyzor check            │
+                                                   └────────────────────────────┘
 ```
 
 This image (s6-overlay supervised):
-- `shim` longrun — `spamcheck_shim.py`, HTTP on `:8077`, wraps the CLIs.
-- `dccifd` longrun — DCC interface daemon the shim's `dccproc` uses.
+- `shim` longrun — `spamcheck_shim.py`, HTTP on `:8077`, runs as the
+  unprivileged **drp** user, queries the CLIs concurrently.
 - `init-bootstrap` oneshot — DCC map / Razor identity / Pyzor servers setup.
 
-Each backend is **best-effort**: a dead network degrades scoring, never
-availability. The container healthcheck only requires the shim's `/health`.
+dccproc contacts the DCC servers directly (no dccifd daemon). Each backend is
+**best-effort**: a dead network degrades scoring, never availability. The
+healthcheck only requires the shim's `/health`.
+
+**Hardening:** non-root shim, bounded concurrency, **token-authenticated** POST
+endpoints, read-only rootfs + `cap_drop: ALL` + `no-new-privileges` (compose),
+not published to the host.
 
 ## 1. Run the backend
 
+The shim refuses every POST (503) until a token is set, and is reachable only on
+the docker network — so use compose:
+
 ```bash
-docker run -d --name rspamd-drp \
-  -p 8077:8077 \
-  -v drp-razor:/var/lib/razor -v drp-pyzor:/var/lib/pyzor -v drp-dcc:/var/dcc \
-  eilandert/rspamd-dcc-razor-pyzor:latest
+mkdir -p secrets && openssl rand -hex 32 > secrets/drp_token.txt
+docker compose up -d        # see docker-compose.yml
 ```
 
-or `docker compose up -d` (see [docker-compose.yml](docker-compose.yml)).
-
-Keep `:8077` on a private network — it accepts raw messages and has no auth.
+The backend is then reachable from containers on the same docker network as
+`http://rspamd-drp:8077` (no host port). Put the same token on the clients.
 
 ## Identities
 
@@ -83,10 +88,12 @@ cp rspamd/local.d/groups.conf          /etc/rspamd/local.d/   # symbol scores
 echo 'dofile("/etc/rspamd/plugins/dcc_razor_pyzor.lua")' >> /etc/rspamd/rspamd.local.lua
 ```
 
-Point the plugin at the backend in `local.d/dcc_razor_pyzor.conf`:
+Point the plugin at the backend and set the **same token** in
+`local.d/dcc_razor_pyzor.conf`:
 
 ```
-url = "http://rspamd-drp:8077/check";   # backend container/host:port
+url   = "http://rspamd-drp:8077/check";   # backend container/host:port
+token = "the-shared-secret";              # must equal the shim's SHIM_TOKEN
 ```
 
 Restart rspamd. Symbols (scores in `groups.conf`, tune to taste):
@@ -97,7 +104,9 @@ Restart rspamd. Symbols (scores in `groups.conf`, tune to taste):
 
 ## HTTP API
 
-Body is always the raw RFC-822 message.
+Body is always the raw RFC-822 message. POST endpoints require the token, as
+`Authorization: Bearer <token>` or `X-DRP-Token: <token>` (401 if wrong, 503 if
+the shim has no token configured). `/health` needs no auth.
 
 - `POST /check` — **query only** (never reports), used by the rspamd plugin → JSON:
 
@@ -134,8 +143,9 @@ cp dovecot/sieve/report-ham.sieve  /usr/lib/dovecot/sieve/
 sievec /usr/lib/dovecot/sieve/report-spam.sieve
 sievec /usr/lib/dovecot/sieve/report-ham.sieve
 cp dovecot/90-drp-sieve.conf       /etc/dovecot/conf.d/
-# point the script at the backend (default http://rspamd-drp:8077):
-#   set DRP_URL in drp-report, or in the dovecot environment
+# backend URL + token (sieve_extprograms scrubs the env, so use the env file):
+printf 'DRP_URL=http://rspamd-drp:8077\nDRP_TOKEN=the-shared-secret\n' \
+  > /etc/dovecot/drp.env
 doveadm reload
 ```
 

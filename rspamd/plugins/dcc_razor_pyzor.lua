@@ -28,6 +28,7 @@ local N = "dcc_razor_pyzor"
 -- Defaults; overridden by the matching section in local.d/.
 local settings = {
   url = "http://127.0.0.1:8077/check",
+  token = "",                       -- shared secret; must match the shim's SHIM_TOKEN
   timeout = 8.0,
   max_size = 1024 * 1024, -- don't ship messages larger than 1 MiB to the shim
   symbol_dcc = "DRP_DCC_BULK",
@@ -103,6 +104,11 @@ local function check_cb(task)
     parse_response(task, body)
   end
 
+  local headers = { ["Content-Type"] = "message/rfc822" }
+  if settings.token and settings.token ~= "" then
+    headers["X-DRP-Token"] = settings.token
+  end
+
   rspamd_http.request({
     task = task,
     url = settings.url,
@@ -110,7 +116,7 @@ local function check_cb(task)
     callback = http_cb,
     timeout = settings.timeout,
     method = "POST",
-    headers = { ["Content-Type"] = "message/rfc822" },
+    headers = headers,
   })
 end
 

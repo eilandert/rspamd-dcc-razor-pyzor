@@ -21,6 +21,7 @@ set -u
 
 ACTION="${1:-report}"
 DRP_URL="${DRP_URL:-http://rspamd-drp:8077}"
+DRP_TOKEN="${DRP_TOKEN:-}"          # must match the shim's SHIM_TOKEN
 
 case "$ACTION" in
     report)      EP="$DRP_URL/report" ;;
@@ -28,8 +29,9 @@ case "$ACTION" in
     *) echo "usage: drp-report report|revoke" >&2; exit 0 ;;
 esac
 
-curl -fsS --max-time 10 \
-    -H "Content-Type: message/rfc822" \
-    --data-binary @- "$EP" >/dev/null 2>&1 || true
+set -- -fsS --max-time 10 -H "Content-Type: message/rfc822"
+[ -n "$DRP_TOKEN" ] && set -- "$@" -H "X-DRP-Token: $DRP_TOKEN"
+
+curl "$@" --data-binary @- "$EP" >/dev/null 2>&1 || true
 
 exit 0

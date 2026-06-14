@@ -3,44 +3,49 @@ services:
     image: eilandert/rspamd-dcc-razor-pyzor:latest
     container_name: rspamd-drp
     restart: unless-stopped
+
+    # No `ports:` — the shim is NOT published to the host. It is reachable only
+    # on the internal docker network, by service name, from your rspamd (and
+    # dovecot) containers: http://rspamd-drp:8077
+    networks:
+      - drp
+
     environment:
       TZ: Europe/Amsterdam
 
+      # --- Auth (required) --------------------------------------------------
+      # The shim refuses every POST (503) until a token is set. The rspamd
+      # plugin and dovecot drp-report must present the same value. Prefer the
+      # _FILE form (Docker secret) over an inline value.
+      SHIM_TOKEN_FILE: /run/secrets/drp_token
+      # or, inline (less safe): SHIM_TOKEN: "change-me"
+
       # --- Identities (all optional) ----------------------------------------
-      # Precedence per network: explicit value here > existing file in the
-      # volume > anonymous auto-registration on first boot. Every var below
-      # also accepts a "<VAR>_FILE" form pointing at a file (Docker secrets).
-
-      # DCC: register a client-id (higher query limits than anonymous).
+      # Precedence per network: explicit value > existing file in volume >
+      # anonymous. Every var also accepts a "<VAR>_FILE" form (Docker secrets).
       # DCC_CLIENT_ID: "1234567"
-      # DCC_CLIENT_PASSWD: "your-dcc-password"
-      # ...or drop a complete /var/dcc/ids file verbatim:
-      # DCC_IDS: |
-      #   1234567 your-dcc-password
-
-      # Razor: register/link a specific account...
+      # DCC_CLIENT_PASSWD_FILE: /run/secrets/dcc_pass
       # RAZOR_REGISTER_USER: "you@example.com"
-      # RAZOR_REGISTER_PASS: "your-razor-password"
-      # ...or install a pre-made identity file verbatim:
-      # RAZOR_IDENTITY: "the-contents-of-your-razor-identity-file"
-
-      # Pyzor: usually anonymous. Override the server list / supply an account:
+      # RAZOR_REGISTER_PASS_FILE: /run/secrets/razor_pass
       # PYZOR_SERVERS: "public.pyzor.org:24441"
-      # PYZOR_ACCOUNT: "public.pyzor.org : 24441 : user : key"
 
-    ports:
-      - "8077:8077"     # spamcheck shim — queried by the external rspamd plugin
+    secrets:
+      - drp_token
+
     volumes:
       - drp-razor:/var/lib/razor
       - drp-pyzor:/var/lib/pyzor
       - drp-dcc:/var/dcc
 
-    # Prefer secrets over inline values for the credentials above, e.g.:
-    # secrets:
-    #   - razor_pass
-    # environment:
-    #   RAZOR_REGISTER_USER: "you@example.com"
-    #   RAZOR_REGISTER_PASS_FILE: /run/secrets/razor_pass
+    # --- Hardening ---------------------------------------------------------
+    read_only: true                 # immutable rootfs; only the mounts + tmpfs writable
+    tmpfs:
+      - /run:exec,mode=0755         # s6 runtime + /run/dcc (exec: s6 runs helpers)
+      - /tmp:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
     healthcheck:
       test: ["CMD", "/healthcheck.sh"]
@@ -49,11 +54,17 @@ services:
       start_period: 20s
       retries: 3
 
+networks:
+  drp:
+    # Attach your rspamd/dovecot stack to this same network (external: true if
+    # it already exists elsewhere).
+    driver: bridge
+
 volumes:
   drp-razor:
   drp-pyzor:
   drp-dcc:
 
-# secrets:
-#   razor_pass:
-#     file: ./secrets/razor_pass.txt
+secrets:
+  drp_token:
+    file: ./secrets/drp_token.txt   # one line: the shared secret

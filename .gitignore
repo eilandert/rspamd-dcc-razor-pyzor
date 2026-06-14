@@ -2,3 +2,5 @@
 __pycache__/
 *.log
 *.tmp
+# local secrets (compose `secrets:` source) — never commit
+secrets/

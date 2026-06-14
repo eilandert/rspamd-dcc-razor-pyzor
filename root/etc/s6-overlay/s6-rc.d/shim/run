@@ -1,7 +1,10 @@
 #!/bin/sh
 # spamcheck_shim longrun — HTTP wrapper around dccproc / razor-check / pyzor that
-# rspamd's dcc_razor_pyzor.lua plugin queries. Foreground; s6 supervises.
+# rspamd's dcc_razor_pyzor.lua plugin (and Dovecot's drp-report) query.
+# Runs as the unprivileged `drp` user, NOT root: it forks razor/pyzor/dccproc on
+# attacker-controlled message bytes. dccproc is set-UID dcc so DCC still works;
+# razor/pyzor read their homes (chowned to drp in init-bootstrap). s6 supervises.
 exec 2>&1
 export RAZORHOME="${RAZORHOME:-/var/lib/razor}"
 export PYZOR_HOME="${PYZOR_HOME:-/var/lib/pyzor}"
-exec python3 /opt/drp/shim/spamcheck_shim.py
+exec s6-setuidgid drp python3 /opt/drp/shim/spamcheck_shim.py

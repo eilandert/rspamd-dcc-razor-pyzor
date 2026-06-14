@@ -1,11 +1,10 @@
 # syntax=docker/dockerfile:1.7
 # Standalone DCC/Razor/Pyzor backend for rspamd, supervised by s6-overlay.
-# This image runs NO rspamd. It exposes one HTTP endpoint (:8077) that rspamd's
-# dcc_razor_pyzor.lua plugin (shipped in this repo, installed into a SEPARATE
-# rspamd container) queries over the network.
-#   * spamcheck_shim    — HTTP wrapper around the three CLIs (s6 longrun, :8077)
-#   * dccifd            — DCC interface daemon (s6 longrun)
-#   * razor / pyzor     — per-message CLIs invoked by the shim
+# This image runs NO rspamd. It exposes one authenticated HTTP endpoint (:8077)
+# that rspamd's dcc_razor_pyzor.lua plugin (in a SEPARATE container) queries.
+#   * spamcheck_shim — HTTP wrapper around the three CLIs (s6 longrun, runs as
+#     the unprivileged `drp` user). dccproc is set-UID dcc; razor/pyzor run as drp.
+#   * razor / pyzor / dccproc — per-message CLIs invoked by the shim.
 #
 # dcc / razor / pyzor come from our own Debian packages on deb.myguard.nl (the
 # apt repo + signing key are already configured in eilandert/debian-base).
@@ -22,8 +21,6 @@ ENV DEBIAN_FRONTEND="noninteractive" \
     S6_BEHAVIOUR_IF_STAGE2_FAILS=2
 
 ARG S6_OVERLAY_VERSION=3.2.1.0
-ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
-ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz /tmp/
 
 RUN set -ex; \
     apt-get -y update; \
@@ -34,12 +31,24 @@ RUN set -ex; \
       razor \
       pyzor \
       python3; \
-    # s6-overlay
-    tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
-    tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz; \
-    rm -f /tmp/s6-overlay-*.tar.xz; \
+    # s6-overlay (verify sha256 against the upstream checksum files).
+    cd /tmp; \
+    for f in s6-overlay-noarch.tar.xz s6-overlay-x86_64.tar.xz; do \
+      base="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
+      curl -fsSL "${base}/${f}"        -o "${f}"; \
+      curl -fsSL "${base}/${f}.sha256" -o "${f}.sha256"; \
+      sha256sum -c "${f}.sha256"; \
+      tar -C / -Jxpf "${f}"; \
+      rm -f "${f}" "${f}.sha256"; \
+    done; \
+    # Unprivileged user the shim runs as (forks razor/pyzor on hostile input).
+    adduser --system --group --no-create-home --home /var/lib/drp drp; \
     mkdir -p "${RAZORHOME}" "${PYZOR_HOME}" /run/dcc; \
+    chown -R drp:drp "${RAZORHOME}" "${PYZOR_HOME}"; \
     chown dcc:dcc /run/dcc 2>/dev/null || true; \
+    # Build-only: xz-utils was needed solely to extract s6. curl stays (used by
+    # the HEALTHCHECK at runtime).
+    apt-get -y purge xz-utils; \
     apt-get -y autoremove; \
     apt-get -y clean autoclean; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt /usr/local/share/man
@@ -54,10 +63,13 @@ COPY --chmod=0755 healthcheck.sh /healthcheck.sh
 RUN set -ex; \
     chmod 0755 /opt/drp/shim/spamcheck_shim.py \
                /etc/s6-overlay/scripts/init-bootstrap.sh \
-               /etc/s6-overlay/s6-rc.d/dccifd/run \
                /etc/s6-overlay/s6-rc.d/shim/run
 
-# spamcheck shim HTTP endpoint queried by the external rspamd plugin.
+# Persist identities/state so they survive container recreation.
+VOLUME [ "/var/lib/razor", "/var/lib/pyzor", "/var/dcc" ]
+
+# spamcheck shim HTTP endpoint queried by the external rspamd plugin. Reachable
+# on the docker network only — do NOT publish to the host (see docker-compose).
 EXPOSE 8077
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

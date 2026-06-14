@@ -1,19 +1,21 @@
 #!/bin/sh
 # s6 oneshot: one-time setup for the standalone DRP backend. Must exit 0 before
-# the longruns (dccifd, shim) start. Backend setup failures are non-fatal — a
-# missing network just degrades that filter; only a broken container would block.
+# the shim longrun starts. Backend setup failures are non-fatal — a missing
+# network just degrades that filter; only a broken container would block.
 #
 # Identities (Razor account, DCC client-id, Pyzor account) can be supplied via
 # environment so a known/shared identity survives volume resets and can be reused
 # across instances. Precedence for each: explicit env > existing file in the
 # volume > anonymous auto-registration. Every credential var also honours a
 # "<VAR>_FILE" form (Docker/compose secrets): the value is read from that path.
+#
+# The shim runs as the unprivileged `drp` user, so the Razor/Pyzor homes are
+# chowned to drp here. DCC's dccproc is set-UID dcc and uses /var/dcc directly.
 set -eu
 
 echo "[DRP] standalone DCC/Razor/Pyzor backend — docs: https://github.com/eilandert/rspamd-dcc-razor-pyzor"
 
 # resolve VAR: echo $VAR, or the contents of the file named by ${VAR}_FILE.
-# Usage: val="$(resolve RAZOR_REGISTER_PASS)"
 resolve() {
     _v="$1"
     eval "_file=\${${_v}_FILE:-}"
@@ -24,19 +26,19 @@ resolve() {
     eval "printf '%s' \"\${${_v}:-}\""
 }
 
-# Timezone
+# Timezone (tolerant: /etc is read-only when the rootfs is read_only).
 if [ -n "${TZ:-}" ]; then
-    rm -f /etc/timezone /etc/localtime
-    echo "${TZ}" > /etc/timezone
-    ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime
+    { rm -f /etc/timezone /etc/localtime \
+        && echo "${TZ}" > /etc/timezone \
+        && ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime; } 2>/dev/null \
+        || echo "[DRP] TZ: /etc not writable (read-only rootfs?); skipping" >&2
 fi
 
 # ---------------------------------------------------------------------------
-# DCC (from the `dcc` package): dccifd needs a /var/dcc home with a server map
-# and the /run/dcc socket dir (normally created by tmpfiles, which doesn't run
-# in a container). Identity: DCC_IDS (raw /var/dcc/ids content) takes priority,
-# else DCC_CLIENT_ID (+ DCC_CLIENT_PASSWD) registers a client-id via cdcc, else
-# DCC stays anonymous. Never fatal — DCC degrades to "unknown".
+# DCC (from the `dcc` package): dccproc (set-UID dcc) queries the DCC servers
+# directly using /var/dcc/map. Identity: DCC_IDS (raw /var/dcc/ids content) takes
+# priority, else DCC_CLIENT_ID (+ DCC_CLIENT_PASSWD) registers a client-id via
+# cdcc, else DCC stays anonymous. Never fatal — DCC degrades to "unknown".
 # ---------------------------------------------------------------------------
 if command -v cdcc >/dev/null 2>&1; then
     mkdir -p /run/dcc
@@ -69,10 +71,9 @@ if command -v cdcc >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Razor (RAZORHOME). Identity: RAZOR_IDENTITY (raw identity-file content) takes
-# priority, else RAZOR_REGISTER_USER (+ RAZOR_REGISTER_PASS) registers/links that
-# account, else an anonymous identity is auto-registered on first boot.
-# Idempotent: skipped once an identity already exists in the volume.
+# Razor (RAZORHOME, owned by drp). Identity: RAZOR_IDENTITY (raw identity-file
+# content) takes priority, else RAZOR_REGISTER_USER (+ RAZOR_REGISTER_PASS)
+# registers/links that account, else an anonymous identity is auto-registered.
 # ---------------------------------------------------------------------------
 export RAZORHOME=/var/lib/razor
 if command -v razor-admin >/dev/null 2>&1; then
@@ -101,12 +102,13 @@ if command -v razor-admin >/dev/null 2>&1; then
             razor-admin -home="$RAZORHOME" -register >/dev/null 2>&1 || true
         fi
     fi
+    chown -R drp:drp "$RAZORHOME" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
-# Pyzor (PYZOR_HOME). Pyzor is anonymous against the public server by default.
-# PYZOR_SERVERS overrides the server list; PYZOR_ACCOUNT supplies an accounts
-# file for authenticated reporting. Otherwise discover the public list once.
+# Pyzor (PYZOR_HOME, owned by drp). Anonymous against the public server by
+# default. PYZOR_SERVERS overrides the server list; PYZOR_ACCOUNT supplies an
+# accounts file for authenticated reporting.
 # ---------------------------------------------------------------------------
 export PYZOR_HOME=/var/lib/pyzor
 if command -v pyzor >/dev/null 2>&1; then
@@ -128,7 +130,12 @@ if command -v pyzor >/dev/null 2>&1; then
         printf '%s\n' "${PYZOR_ACCOUNT}" > "$PYZOR_HOME/accounts"
         chmod 0600 "$PYZOR_HOME/accounts"
     fi
+    chown -R drp:drp "$PYZOR_HOME" 2>/dev/null || true
 fi
 
-echo "[DRP] init-bootstrap complete; handing off to s6-supervised services."
+if [ -z "${SHIM_TOKEN:-}" ] && [ -z "${SHIM_TOKEN_FILE:-}" ]; then
+    echo "[DRP] WARNING: no SHIM_TOKEN/_FILE set — the shim will refuse all POSTs (503)." >&2
+fi
+
+echo "[DRP] init-bootstrap complete; handing off to the shim."
 exit 0
