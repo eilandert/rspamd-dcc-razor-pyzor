@@ -5,12 +5,43 @@ services:
     restart: unless-stopped
     environment:
       TZ: Europe/Amsterdam
+
+      # --- Identities (all optional) ----------------------------------------
+      # Precedence per network: explicit value here > existing file in the
+      # volume > anonymous auto-registration on first boot. Every var below
+      # also accepts a "<VAR>_FILE" form pointing at a file (Docker secrets).
+
+      # DCC: register a client-id (higher query limits than anonymous).
+      # DCC_CLIENT_ID: "1234567"
+      # DCC_CLIENT_PASSWD: "your-dcc-password"
+      # ...or drop a complete /var/dcc/ids file verbatim:
+      # DCC_IDS: |
+      #   1234567 your-dcc-password
+
+      # Razor: register/link a specific account...
+      # RAZOR_REGISTER_USER: "you@example.com"
+      # RAZOR_REGISTER_PASS: "your-razor-password"
+      # ...or install a pre-made identity file verbatim:
+      # RAZOR_IDENTITY: "the-contents-of-your-razor-identity-file"
+
+      # Pyzor: usually anonymous. Override the server list / supply an account:
+      # PYZOR_SERVERS: "public.pyzor.org:24441"
+      # PYZOR_ACCOUNT: "public.pyzor.org : 24441 : user : key"
+
     ports:
       - "8077:8077"     # spamcheck shim — queried by the external rspamd plugin
     volumes:
       - drp-razor:/var/lib/razor
       - drp-pyzor:/var/lib/pyzor
       - drp-dcc:/var/dcc
+
+    # Prefer secrets over inline values for the credentials above, e.g.:
+    # secrets:
+    #   - razor_pass
+    # environment:
+    #   RAZOR_REGISTER_USER: "you@example.com"
+    #   RAZOR_REGISTER_PASS_FILE: /run/secrets/razor_pass
+
     healthcheck:
       test: ["CMD", "/healthcheck.sh"]
       interval: 30s
@@ -22,3 +53,7 @@ volumes:
   drp-razor:
   drp-pyzor:
   drp-dcc:
+
+# secrets:
+#   razor_pass:
+#     file: ./secrets/razor_pass.txt

@@ -45,6 +45,35 @@ or `docker compose up -d` (see [docker-compose.yml](docker-compose.yml)).
 
 Keep `:8077` on a private network — it accepts raw messages and has no auth.
 
+## Identities
+
+Each network has an identity that is auto-created on first boot and persisted in
+the named volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
+
+| Network | Identity | Anonymous default |
+|---------|----------|-------------------|
+| Razor | account registered via `razor-admin` | yes (random identity) |
+| DCC | client-id in `/var/dcc/ids` | yes (anonymous id) |
+| Pyzor | optional accounts file | yes (anonymous to public server) |
+
+Anonymous is fine for most setups. To use a **known/shared identity** — so it
+survives a volume reset or is reused across instances — supply it via the
+environment (see [docker-compose.yml](docker-compose.yml)):
+
+```yaml
+environment:
+  DCC_CLIENT_ID: "1234567"
+  DCC_CLIENT_PASSWD: "…"          # or DCC_IDS: <whole /var/dcc/ids file>
+  RAZOR_REGISTER_USER: "you@example.com"
+  RAZOR_REGISTER_PASS: "…"        # or RAZOR_IDENTITY: <identity file content>
+  PYZOR_SERVERS: "public.pyzor.org:24441"
+```
+
+Precedence per network: **explicit env > existing file in the volume >
+anonymous**. Every credential var also accepts a `<VAR>_FILE` form (Docker
+secrets) — e.g. `RAZOR_REGISTER_PASS_FILE=/run/secrets/razor_pass` — so secrets
+never have to sit in the compose file.
+
 ## 2. Install the plugin into your rspamd
 
 ```bash
