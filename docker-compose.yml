@@ -1,0 +1,23 @@
+services:
+  rspamd-drp:
+    image: eilandert/rspamd-dcc-razor-pyzor:latest
+    container_name: rspamd-drp
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Amsterdam
+    ports:
+      - "11332:11332"   # normal worker (milter/proxy)
+      - "11334:11334"   # controller / web UI
+    volumes:
+      - rspamd-data:/var/lib/rspamd
+      # Optional: override config / plugin tuning
+      # - ./rspamd/local.d:/etc/rspamd/local.d:ro
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  rspamd-data:

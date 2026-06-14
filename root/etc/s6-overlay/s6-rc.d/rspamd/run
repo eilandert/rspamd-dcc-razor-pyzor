@@ -1,0 +1,7 @@
+#!/bin/sh
+# rspamd longrun (the main service). Foreground, no privilege drop here — rspamd
+# drops to the rspamd user itself per its worker config. s6 respawns on exit.
+# Depends on init-bootstrap (config), shim and dccifd (so the backends are up
+# before the first message is scanned).
+exec 2>&1
+exec /usr/bin/rspamd -f -u rspamd -g rspamd

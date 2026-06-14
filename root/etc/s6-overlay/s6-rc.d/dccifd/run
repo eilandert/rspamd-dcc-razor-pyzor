@@ -1,0 +1,10 @@
+#!/bin/sh
+# dccifd longrun — the DCC interface daemon the shim's dccproc talks to. Runs in
+# the foreground as the dcc user; s6 respawns it on exit. If DCC was not built
+# into the image (offline build), idle instead of crash-looping.
+exec 2>&1
+if [ ! -x /var/dcc/libexec/dccifd ]; then
+    echo "[dccifd] /var/dcc/libexec/dccifd absent — DCC disabled; idling" >&2
+    exec sleep infinity
+fi
+exec s6-setuidgid dcc /var/dcc/libexec/dccifd -f -i /var/dcc
