@@ -1,0 +1,18 @@
+name: docker-integration
+# Manual: builds the real image and smoke-tests the HTTP API. Needs the
+# eilandert/debian-base image + the deb.myguard.nl apt repo (for dcc/razor/pyzor),
+# so it is not run on every push.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull base image
+        run: docker pull eilandert/debian-base:stable
+
+      - name: Build + integration smoke test
+        run: ./ci-build.sh docker
