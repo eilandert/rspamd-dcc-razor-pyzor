@@ -37,7 +37,9 @@ import json
 import os
 import re
 import subprocess
+import hashlib
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -46,6 +48,11 @@ PORT = int(os.environ.get("SHIM_PORT", "8077"))
 TIMEOUT = float(os.environ.get("SHIM_BACKEND_TIMEOUT", "6"))
 MAX_CONCURRENT = int(os.environ.get("SHIM_MAX_CONCURRENT", "8"))
 MAX_BODY = 8 * 1024 * 1024
+# /check verdict cache: DCC/Razor/Pyzor target BULK mail (identical bodies repeat),
+# so caching by body hash short-circuits the expensive razor/pyzor network calls
+# on exactly the traffic they target. TTL 0 disables. Never caches /report|/revoke.
+CACHE_TTL = float(os.environ.get("SHIM_CACHE_TTL", "300"))
+CACHE_SIZE = int(os.environ.get("SHIM_CACHE_SIZE", "4096"))
 
 DCCPROC = os.environ.get("DCCPROC", "/usr/bin/dccproc")
 RAZOR_CHECK = os.environ.get("RAZOR_CHECK", "razor-check")
@@ -75,6 +82,40 @@ TOKEN = _load_token()
 # Bound the number of requests processed at once; each request can fork up to
 # three CLIs, so an unbounded server would be a fork bomb under load.
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+# Verdict cache for /check (body-hash -> serialized JSON, with expiry).
+_cache = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(key):
+    if CACHE_TTL <= 0:
+        return None
+    now = time.time()
+    with _cache_lock:
+        v = _cache.get(key)
+        if not v:
+            return None
+        exp, data = v
+        if exp < now:
+            _cache.pop(key, None)
+            return None
+        return data
+
+
+def _cache_put(key, data):
+    if CACHE_TTL <= 0:
+        return
+    now = time.time()
+    with _cache_lock:
+        if len(_cache) >= CACHE_SIZE:
+            # evict expired, then oldest, to make room
+            for k in [k for k, (e, _) in _cache.items() if e < now]:
+                _cache.pop(k, None)
+            while len(_cache) >= CACHE_SIZE:
+                oldest = min(_cache, key=lambda k: _cache[k][0])
+                _cache.pop(oldest, None)
+        _cache[key] = (now + CACHE_TTL, data)
 
 _DCC_BULK_RE = re.compile(rb"\bbulk\b", re.IGNORECASE)
 _DCC_BODY_RE = re.compile(rb"Body=(\d+|many)", re.IGNORECASE)
@@ -238,11 +279,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         msg = self.rfile.read(length)
 
+        # /check is cacheable (idempotent query); /report|/revoke are not.
+        cache_key = None
+        if self.path == "/check":
+            cache_key = hashlib.sha256(msg).hexdigest()
+            hit = _cache_get(cache_key)
+            if hit is not None:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("X-DRP-Cache", "hit")
+                self.send_header("Content-Length", str(len(hit)))
+                self.end_headers()
+                self.wfile.write(hit if isinstance(hit, bytes) else hit.encode())
+                return
+
         if not _sem.acquire(timeout=TIMEOUT):
             self._send(503, json.dumps({"error": "busy"}))
             return
         try:
-            self._send(200, json.dumps(handler(msg)))
+            body = json.dumps(handler(msg))
+            if cache_key is not None:
+                _cache_put(cache_key, body)
+            self._send(200, body)
         except Exception as e:  # never 500 the caller; log and return safe defaults
             self.log_error("%s failed: %s", self.path, e)
             if self.path == "/check":
@@ -270,6 +328,7 @@ def main():
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[shim] listening on {HOST}:{PORT} "
           f"(timeout={TIMEOUT}s, max_concurrent={MAX_CONCURRENT}, "
+          f"cache_ttl={CACHE_TTL}s/{CACHE_SIZE}, "
           f"auth={'on' if TOKEN else 'OFF'})", flush=True)
     try:
         srv.serve_forever()

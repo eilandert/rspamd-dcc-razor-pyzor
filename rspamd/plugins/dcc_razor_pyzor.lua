@@ -83,6 +83,10 @@ local function parse_response(task, body)
 end
 
 local function check_cb(task)
+  -- Skip authenticated / outbound mail: no point collaborative-checking what our
+  -- own users send, and it saves a razor/pyzor round-trip per outbound message.
+  if task:get_user() then return end
+
   -- Skip empty / oversized messages.
   local content = task:get_content()
   if not content then return end

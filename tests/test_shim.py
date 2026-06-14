@@ -112,6 +112,7 @@ def server(monkeypatch):
     # benign verdict regardless of endpoint
     monkeypatch.setattr(shim, "_run", _stub(1, b"X-DCC-x: clean"))
     monkeypatch.setattr(shim, "TOKEN", "secret")
+    shim._cache.clear()
     srv = ThreadingHTTPServer(("127.0.0.1", 0), shim.Handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -163,6 +164,42 @@ def test_unknown_path_404(server):
 def test_empty_body_400(server):
     code, _ = _req(server + "/check", "POST", b"", {"X-DRP-Token": "secret"})
     assert code == 400
+
+
+def test_check_cache_hit_skips_backends(server, monkeypatch):
+    calls = {"n": 0}
+
+    def counting(argv, msg):
+        calls["n"] += 1
+        return (1, b"X-DCC-x: clean", b"")
+
+    monkeypatch.setattr(shim, "_run", counting)
+    monkeypatch.setattr(shim, "CACHE_TTL", 300.0)
+    shim._cache.clear()
+
+    body = b"From: a@b.com\nSubject: bulk\n\nidentical bulk body\n"
+    c1, r1 = _req(server + "/check", "POST", body, {"X-DRP-Token": "secret"})
+    first = calls["n"]
+    assert c1 == 200 and first == 3            # dcc+razor+pyzor ran once
+
+    c2, r2 = _req(server + "/check", "POST", body, {"X-DRP-Token": "secret"})
+    assert c2 == 200 and r2 == r1
+    assert calls["n"] == first                 # cache hit -> no extra backend calls
+
+
+def test_report_not_cached(server, monkeypatch):
+    calls = {"n": 0}
+
+    def counting(argv, msg):
+        calls["n"] += 1
+        return (0, b"", b"")
+
+    monkeypatch.setattr(shim, "_run", counting)
+    monkeypatch.setattr(shim, "CACHE_TTL", 300.0)
+    body = b"From: a@b.com\n\nx\n"
+    _req(server + "/report", "POST", body, {"X-DRP-Token": "secret"})
+    _req(server + "/report", "POST", body, {"X-DRP-Token": "secret"})
+    assert calls["n"] == 6                      # 3 backends x 2 (never cached)
 
 
 def test_fail_closed_when_no_token(monkeypatch):
