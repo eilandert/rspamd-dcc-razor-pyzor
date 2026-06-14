@@ -56,9 +56,9 @@ RUN set -ex; \
     apt-get -y clean autoclean; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt /usr/local/share/man
 
-# Project payload (shim + s6 service tree). The rspamd/ plugin + configs are
-# shipped too (under /opt/drp/rspamd) for installation into an external rspamd.
-COPY rspamd/ /opt/drp/rspamd/
+# Project payload (shim + razor daemon + s6 service tree). The rspamd plugin
+# lives in the repo (../rspamd) for installing into a SEPARATE rspamd — the
+# backend image runs no rspamd and does not bake the plugin.
 COPY shim/   /opt/drp/shim/
 COPY razord/ /opt/drp/razord/
 COPY root/   /

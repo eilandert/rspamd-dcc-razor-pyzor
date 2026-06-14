@@ -14,7 +14,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shim"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "docker", "shim"))
 import spamcheck_shim as shim  # noqa: E402
 
 

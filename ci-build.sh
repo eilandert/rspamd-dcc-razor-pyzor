@@ -22,16 +22,17 @@ run_lint() {
     note "lint"
     if command -v shellcheck >/dev/null; then
         # SC1091: drp.env is sourced at runtime; not available to follow here.
-        shellcheck -s sh -e SC1091 healthcheck.sh \
-            root/etc/s6-overlay/scripts/init-bootstrap.sh \
-            root/etc/s6-overlay/s6-rc.d/shim/run \
+        shellcheck -s sh -e SC1091 docker/healthcheck.sh \
+            docker/root/etc/s6-overlay/scripts/init-bootstrap.sh \
+            docker/root/etc/s6-overlay/s6-rc.d/shim/run \
+            docker/root/etc/s6-overlay/s6-rc.d/razord/run \
             dovecot/drp-report || rc=1
     else skip "shellcheck not installed"; fi
 
     if command -v ruff >/dev/null; then
-        ruff check shim/ tests/ || rc=1
+        ruff check docker/shim/ tests/ || rc=1
     else skip "ruff not installed"; fi
-    python3 -m py_compile shim/spamcheck_shim.py tests/test_shim.py || rc=1
+    python3 -m py_compile docker/shim/spamcheck_shim.py tests/test_shim.py || rc=1
 
     if command -v luacheck >/dev/null; then
         luacheck rspamd/plugins/ || rc=1
@@ -53,7 +54,7 @@ run_docker() {
         skip "docker disabled or absent"; return
     fi
     local img="drp-ci:test" name="drp-ci-$$" tok="ci-token-$$"
-    docker build -f Dockerfile-deb -t "$img" . || { rc=1; return; }
+    docker build -f docker/Dockerfile-deb -t "$img" docker/ || { rc=1; return; }
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" -e SHIM_TOKEN="$tok" "$img" >/dev/null
     trap 'docker rm -f "$name" >/dev/null 2>&1 || true' RETURN

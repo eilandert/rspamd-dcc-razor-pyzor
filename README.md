@@ -43,8 +43,9 @@ The shim refuses every POST (503) until a token is set, and is reachable only on
 the docker network — so use compose:
 
 ```bash
+cd docker
 mkdir -p secrets && openssl rand -hex 32 > secrets/drp_token.txt
-docker compose up -d        # see docker-compose.yml
+docker compose up -d        # see docker/docker-compose.yml
 ```
 
 The backend is then reachable from containers on the same docker network as
@@ -63,7 +64,7 @@ the named volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
 
 Anonymous is fine for most setups. To use a **known/shared identity** — so it
 survives a volume reset or is reused across instances — supply it via the
-environment (see [docker-compose.yml](docker-compose.yml)):
+environment (see [docker/docker-compose.yml](docker/docker-compose.yml)):
 
 ```yaml
 environment:
@@ -162,7 +163,7 @@ the IMAP move.
 ## Build
 
 ```bash
-docker build -f Dockerfile-deb -t eilandert/rspamd-dcc-razor-pyzor:latest .
+docker build -f docker/Dockerfile-deb -t eilandert/rspamd-dcc-razor-pyzor:latest docker/
 ```
 
 In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo
