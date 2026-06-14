@@ -64,9 +64,10 @@ RAZOR_CHECK = os.environ.get("RAZOR_CHECK", "razor-check")
 RAZOR_REPORT = os.environ.get("RAZOR_REPORT", "razor-report")
 RAZOR_REVOKE = os.environ.get("RAZOR_REVOKE", "razor-revoke")
 PYZOR = os.environ.get("PYZOR", "pyzor")
-# Persistent razor daemon (razorfy) — avoids the perl-startup + agent-init cost
-# of razor-check per message. "host:port" or empty to use the razor-check CLI.
-RAZORD_ADDR = os.environ.get("SHIM_RAZORD_ADDR", "127.0.0.1:11342").strip()
+# Optional persistent razor daemon (razorfy) at "host:port". OFF by default:
+# benchmarks showed razorfy (~1450ms) is ~4x SLOWER than the razor-check CLI
+# (~330ms) because it rebuilds its Razor2 agent per connection. Left as opt-in.
+RAZORD_ADDR = os.environ.get("SHIM_RAZORD_ADDR", "").strip()
 
 # Explicit homedirs: the shim runs as `drp`, whose $HOME is not the state dir, so
 # the CLIs must be told where their identity/servers live (env RAZORHOME works
