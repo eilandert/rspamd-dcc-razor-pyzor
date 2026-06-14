@@ -53,12 +53,20 @@ MAX_BODY = 8 * 1024 * 1024
 # on exactly the traffic they target. TTL 0 disables. Never caches /report|/revoke.
 CACHE_TTL = float(os.environ.get("SHIM_CACHE_TTL", "300"))
 CACHE_SIZE = int(os.environ.get("SHIM_CACHE_SIZE", "4096"))
+# Optional Redis cache backend, shared across distributed scanners. When set
+# (e.g. redis://valkey:6379/3) the /check verdict cache lives in Redis so every
+# rspamd-drp instance shares it; otherwise an in-process LRU is used.
+REDIS_URL = os.environ.get("SHIM_REDIS_URL", "").strip()
+REDIS_PREFIX = os.environ.get("SHIM_REDIS_PREFIX", "drp:check:")
 
 DCCPROC = os.environ.get("DCCPROC", "/usr/bin/dccproc")
 RAZOR_CHECK = os.environ.get("RAZOR_CHECK", "razor-check")
 RAZOR_REPORT = os.environ.get("RAZOR_REPORT", "razor-report")
 RAZOR_REVOKE = os.environ.get("RAZOR_REVOKE", "razor-revoke")
 PYZOR = os.environ.get("PYZOR", "pyzor")
+# Persistent razor daemon (razorfy) — avoids the perl-startup + agent-init cost
+# of razor-check per message. "host:port" or empty to use the razor-check CLI.
+RAZORD_ADDR = os.environ.get("SHIM_RAZORD_ADDR", "127.0.0.1:11342").strip()
 
 # Explicit homedirs: the shim runs as `drp`, whose $HOME is not the state dir, so
 # the CLIs must be told where their identity/servers live (env RAZORHOME works
@@ -83,39 +91,87 @@ TOKEN = _load_token()
 # three CLIs, so an unbounded server would be a fork bomb under load.
 _sem = threading.BoundedSemaphore(MAX_CONCURRENT)
 
-# Verdict cache for /check (body-hash -> serialized JSON, with expiry).
-_cache = {}
-_cache_lock = threading.Lock()
+# Verdict cache for /check. Two backends: in-process LRU (default) and Redis
+# (shared across distributed scanners). Both keyed on sha256(body); value is the
+# serialized JSON verdict. TTL 0 disables caching entirely.
+class _MemoryCache:
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        now = time.time()
+        with self._lock:
+            v = self._d.get(key)
+            if not v:
+                return None
+            exp, data = v
+            if exp < now:
+                self._d.pop(key, None)
+                return None
+            return data
+
+    def put(self, key, data):
+        now = time.time()
+        with self._lock:
+            if len(self._d) >= CACHE_SIZE:
+                for k in [k for k, (e, _) in self._d.items() if e < now]:
+                    self._d.pop(k, None)
+                while len(self._d) >= CACHE_SIZE:
+                    self._d.pop(min(self._d, key=lambda k: self._d[k][0]), None)
+            self._d[key] = (now + CACHE_TTL, data)
+
+
+class _RedisCache:
+    """Shared cache for distributed scanners. Fails open (None / no-store) on any
+    Redis error so a Redis outage degrades to direct backend calls, never an error."""
+    def __init__(self, url):
+        import redis  # python3-redis
+        self._r = redis.from_url(url, socket_timeout=1, socket_connect_timeout=1)
+        self._mem = _MemoryCache()  # L1 in-process, in front of Redis L2
+
+    def get(self, key):
+        v = self._mem.get(key)
+        if v is not None:
+            return v
+        try:
+            data = self._r.get(REDIS_PREFIX + key)
+        except Exception:
+            return None
+        if data is not None:
+            self._mem.put(key, data)
+        return data
+
+    def put(self, key, data):
+        self._mem.put(key, data)
+        try:
+            self._r.setex(REDIS_PREFIX + key, int(CACHE_TTL), data)
+        except Exception:
+            pass
+
+
+def _make_cache():
+    if CACHE_TTL <= 0:
+        return None
+    if REDIS_URL:
+        try:
+            return _RedisCache(REDIS_URL)
+        except Exception as e:
+            import sys
+            sys.stderr.write(f"[shim] Redis cache init failed ({e}); using in-memory\n")
+    return _MemoryCache()
+
+
+_cache_backend = _make_cache()
 
 
 def _cache_get(key):
-    if CACHE_TTL <= 0:
-        return None
-    now = time.time()
-    with _cache_lock:
-        v = _cache.get(key)
-        if not v:
-            return None
-        exp, data = v
-        if exp < now:
-            _cache.pop(key, None)
-            return None
-        return data
+    return _cache_backend.get(key) if _cache_backend else None
 
 
 def _cache_put(key, data):
-    if CACHE_TTL <= 0:
-        return
-    now = time.time()
-    with _cache_lock:
-        if len(_cache) >= CACHE_SIZE:
-            # evict expired, then oldest, to make room
-            for k in [k for k, (e, _) in _cache.items() if e < now]:
-                _cache.pop(k, None)
-            while len(_cache) >= CACHE_SIZE:
-                oldest = min(_cache, key=lambda k: _cache[k][0])
-                _cache.pop(oldest, None)
-        _cache[key] = (now + CACHE_TTL, data)
+    if _cache_backend:
+        _cache_backend.put(key, data)
 
 _DCC_BULK_RE = re.compile(rb"\bbulk\b", re.IGNORECASE)
 _DCC_BODY_RE = re.compile(rb"Body=(\d+|many)", re.IGNORECASE)
@@ -150,8 +206,34 @@ def check_dcc(msg):
     return {"action": action, "bulk": bulk}
 
 
+def _razord_check(msg):
+    """Query the persistent razorfy daemon: send the message, half-close, read the
+    verdict string ('spam'|'ham'|'error', fails safe to ham). Returns True/False/None
+    (None = daemon unreachable -> caller falls back to the CLI)."""
+    import socket
+    try:
+        host, port = RAZORD_ADDR.rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=TIMEOUT) as s:
+            s.sendall(msg)
+            s.shutdown(socket.SHUT_WR)
+            buf = b""
+            while True:
+                chunk = s.recv(64)
+                if not chunk:
+                    break
+                buf += chunk
+        return buf.strip().lower() == b"spam"
+    except Exception:
+        return None
+
+
 def check_razor(msg):
-    # razor-check exits 0 = spam (signature hit), 1 = not listed.
+    # Prefer the persistent razorfy daemon (no perl-startup per message).
+    if RAZORD_ADDR:
+        v = _razord_check(msg)
+        if v is not None:
+            return {"hit": v}
+    # Fallback: razor-check CLI (exit 0 = spam hit, 1 = not listed).
     r = _run([RAZOR_CHECK] + _RAZOR_HOME_ARG, msg)
     if r is None:
         return {"hit": False}
@@ -326,9 +408,10 @@ def main():
             "[shim] WARNING: no SHIM_TOKEN configured — POST endpoints will "
             "refuse all requests (503). Set SHIM_TOKEN or SHIM_TOKEN_FILE.\n")
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    cache = "off" if CACHE_TTL <= 0 else ("redis" if REDIS_URL else "memory")
     print(f"[shim] listening on {HOST}:{PORT} "
           f"(timeout={TIMEOUT}s, max_concurrent={MAX_CONCURRENT}, "
-          f"cache_ttl={CACHE_TTL}s/{CACHE_SIZE}, "
+          f"cache={cache} ttl={CACHE_TTL}s, razord={RAZORD_ADDR or 'off(CLI)'}, "
           f"auth={'on' if TOKEN else 'OFF'})", flush=True)
     try:
         srv.serve_forever()

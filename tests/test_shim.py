@@ -112,7 +112,7 @@ def server(monkeypatch):
     # benign verdict regardless of endpoint
     monkeypatch.setattr(shim, "_run", _stub(1, b"X-DCC-x: clean"))
     monkeypatch.setattr(shim, "TOKEN", "secret")
-    shim._cache.clear()
+    monkeypatch.setattr(shim, "_cache_backend", shim._MemoryCache())
     srv = ThreadingHTTPServer(("127.0.0.1", 0), shim.Handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
@@ -175,7 +175,7 @@ def test_check_cache_hit_skips_backends(server, monkeypatch):
 
     monkeypatch.setattr(shim, "_run", counting)
     monkeypatch.setattr(shim, "CACHE_TTL", 300.0)
-    shim._cache.clear()
+    monkeypatch.setattr(shim, "_cache_backend", shim._MemoryCache())
 
     body = b"From: a@b.com\nSubject: bulk\n\nidentical bulk body\n"
     c1, r1 = _req(server + "/check", "POST", body, {"X-DRP-Token": "secret"})
@@ -200,6 +200,77 @@ def test_report_not_cached(server, monkeypatch):
     _req(server + "/report", "POST", body, {"X-DRP-Token": "secret"})
     _req(server + "/report", "POST", body, {"X-DRP-Token": "secret"})
     assert calls["n"] == 6                      # 3 backends x 2 (never cached)
+
+
+def _fake_razor_server(reply):
+    import socket
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        c, _ = srv.accept()
+        while c.recv(4096):
+            pass
+        c.sendall(reply)
+        c.close()
+        srv.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+
+def test_razord_spam(monkeypatch):
+    port = _fake_razor_server(b"spam")
+    monkeypatch.setattr(shim, "RAZORD_ADDR", f"127.0.0.1:{port}")
+    assert shim.check_razor(b"From: a\n\nx\n") == {"hit": True}
+
+
+def test_razord_ham(monkeypatch):
+    port = _fake_razor_server(b"ham")
+    monkeypatch.setattr(shim, "RAZORD_ADDR", f"127.0.0.1:{port}")
+    assert shim.check_razor(b"From: a\n\nx\n") == {"hit": False}
+
+
+def test_razord_unreachable_falls_back_to_cli(monkeypatch):
+    monkeypatch.setattr(shim, "RAZORD_ADDR", "127.0.0.1:1")  # nothing listening
+    monkeypatch.setattr(shim, "_run", _stub(0))              # CLI says spam
+    assert shim.check_razor(b"x") == {"hit": True}
+
+
+def test_redis_cache_roundtrip_and_graceful():
+    class FakeRedis:
+        def __init__(self):
+            self.d = {}
+
+        def get(self, k):
+            return self.d.get(k)
+
+        def setex(self, k, ttl, v):
+            self.d[k] = v
+
+    rc = shim._RedisCache.__new__(shim._RedisCache)
+    rc._r = FakeRedis()
+    rc._mem = shim._MemoryCache()
+    rc.put("k1", "v1")
+    rc._mem = shim._MemoryCache()                 # drop L1 -> must come from redis
+    assert rc.get("k1") == "v1"
+    assert rc.get("missing") is None
+
+    class BrokenRedis:
+        def get(self, k):
+            raise RuntimeError("down")
+
+        def setex(self, k, ttl, v):
+            raise RuntimeError("down")
+
+    rc.r = BrokenRedis()
+    rc._r = BrokenRedis()
+    rc._mem = shim._MemoryCache()
+    rc.put("k2", "v2")                            # must not raise
+    assert rc.get("k2") == "v2"                   # served from L1 mem
+    rc._mem = shim._MemoryCache()
+    assert rc.get("k2") is None                   # redis broken -> graceful miss
 
 
 def test_fail_closed_when_no_token(monkeypatch):

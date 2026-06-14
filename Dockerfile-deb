@@ -30,7 +30,10 @@ RUN set -ex; \
       dcc \
       razor \
       pyzor \
-      python3; \
+      python3 \
+      python3-redis \
+      perl \
+      libio-socket-ip-perl; \
     # s6-overlay (verify sha256 against the upstream checksum files).
     cd /tmp; \
     for f in s6-overlay-noarch.tar.xz s6-overlay-x86_64.tar.xz; do \
@@ -57,13 +60,16 @@ RUN set -ex; \
 # shipped too (under /opt/drp/rspamd) for installation into an external rspamd.
 COPY rspamd/ /opt/drp/rspamd/
 COPY shim/   /opt/drp/shim/
+COPY razord/ /opt/drp/razord/
 COPY root/   /
 COPY --chmod=0755 healthcheck.sh /healthcheck.sh
 
 RUN set -ex; \
     chmod 0755 /opt/drp/shim/spamcheck_shim.py \
+               /opt/drp/razord/razorfy.pl \
                /etc/s6-overlay/scripts/init-bootstrap.sh \
-               /etc/s6-overlay/s6-rc.d/shim/run
+               /etc/s6-overlay/s6-rc.d/shim/run \
+               /etc/s6-overlay/s6-rc.d/razord/run
 
 # Persist identities/state so they survive container recreation.
 VOLUME [ "/var/lib/razor", "/var/lib/pyzor", "/var/dcc" ]

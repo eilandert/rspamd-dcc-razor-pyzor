@@ -13,6 +13,14 @@ services:
     environment:
       TZ: Europe/Amsterdam
 
+      # --- Cache ------------------------------------------------------------
+      # /check verdicts cached by body hash (DCC/Razor/Pyzor target bulk = repeats).
+      SHIM_CACHE_TTL: "300"            # seconds; 0 disables
+      # SHIM_CACHE_SIZE: "4096"        # in-memory LRU entries
+      # Shared cache across distributed scanners (else in-process LRU):
+      # SHIM_REDIS_URL: "redis://valkey:6379/5"
+      # SHIM_REDIS_PREFIX: "drp:check:"
+
       # --- Auth (required) --------------------------------------------------
       # The shim refuses every POST (503) until a token is set. The rspamd
       # plugin and dovecot drp-report must present the same value. Prefer the
