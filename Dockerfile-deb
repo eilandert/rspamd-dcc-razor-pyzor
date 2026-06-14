@@ -6,6 +6,9 @@
 #   * spamcheck_shim    — HTTP wrapper around the three CLIs (s6 longrun, :8077)
 #   * dccifd            — DCC interface daemon (s6 longrun)
 #   * razor / pyzor     — per-message CLIs invoked by the shim
+#
+# dcc / razor / pyzor come from our own Debian packages on deb.myguard.nl (the
+# apt repo + signing key are already configured in eilandert/debian-base).
 FROM eilandert/debian-base:stable
 LABEL org.opencontainers.image.authors="eilandert"
 LABEL org.opencontainers.image.source="https://github.com/eilandert/rspamd-dcc-razor-pyzor"
@@ -22,37 +25,21 @@ ARG S6_OVERLAY_VERSION=3.2.1.0
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz /tmp/
 
-# DCC has no Debian package (licence). Pin a known source tarball.
-ARG DCC_VERSION=2.3.168
-
 RUN set -ex; \
     apt-get -y update; \
     apt-get --no-install-recommends -y install ca-certificates curl xz-utils; \
+    # The three collaborative-filter backends, from deb.myguard.nl.
     apt-get --no-install-recommends -y install \
-      python3 \
+      dcc \
+      razor \
       pyzor \
-      gcc make libc6-dev; \
-    # razor (package name drifted between releases): try both
-    ( apt-get --no-install-recommends -y install razor-agents \
-      || apt-get --no-install-recommends -y install razor ) || true; \
+      python3; \
     # s6-overlay
     tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
     tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz; \
     rm -f /tmp/s6-overlay-*.tar.xz; \
-    # DCC: dedicated user + build from source -> /var/dcc
-    adduser --system --group --no-create-home --home /var/dcc dcc; \
-    cd /tmp; \
-    curl -fsSL "https://www.dcc-servers.net/dcc/source/old/dcc-${DCC_VERSION}.tar.Z" -o dcc.tar.Z \
-      || curl -fsSL "https://www.dcc-servers.net/dcc/source/dcc.tar.Z" -o dcc.tar.Z; \
-    tar -xf dcc.tar.Z; \
-    cd dcc-*; \
-    ./configure --disable-dccm --with-uid=dcc --homedir=/var/dcc; \
-    make install; \
-    cd /; rm -rf /tmp/dcc*; \
-    chown -R dcc:dcc /var/dcc; \
-    mkdir -p "${RAZORHOME}" "${PYZOR_HOME}"; \
-    # drop build toolchain to keep the image lean
-    apt-get -y purge gcc make libc6-dev; \
+    mkdir -p "${RAZORHOME}" "${PYZOR_HOME}" /run/dcc; \
+    chown dcc:dcc /run/dcc 2>/dev/null || true; \
     apt-get -y autoremove; \
     apt-get -y clean autoclean; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt /usr/local/share/man

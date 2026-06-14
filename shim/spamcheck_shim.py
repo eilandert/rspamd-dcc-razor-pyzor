@@ -37,7 +37,7 @@ PORT = int(os.environ.get("SHIM_PORT", "8077"))
 TIMEOUT = float(os.environ.get("SHIM_BACKEND_TIMEOUT", "6"))
 MAX_BODY = 8 * 1024 * 1024
 
-DCCPROC = os.environ.get("DCCPROC", "/var/dcc/bin/dccproc")
+DCCPROC = os.environ.get("DCCPROC", "/usr/bin/dccproc")
 RAZOR_CHECK = os.environ.get("RAZOR_CHECK", "razor-check")
 PYZOR = os.environ.get("PYZOR", "pyzor")
 

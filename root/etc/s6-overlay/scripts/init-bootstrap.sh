@@ -14,15 +14,18 @@ if [ -n "${TZ:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# DCC: dccifd needs a working /var/dcc home with a server map. The image build
-# ran `make install`; create the map on first run if missing (offline builds may
-# skip it). Never fatal — DCC degrades to "unknown".
+# DCC (from the `dcc` package): dccifd needs a /var/dcc home with a server map
+# and the /run/dcc socket dir (normally created by tmpfiles, which doesn't run
+# in a container). Create the map on first run if missing. Never fatal — DCC
+# degrades to "unknown".
 # ---------------------------------------------------------------------------
-if [ -x /var/dcc/bin/cdcc ]; then
+if command -v cdcc >/dev/null 2>&1; then
+    mkdir -p /run/dcc
+    chown dcc:dcc /run/dcc 2>/dev/null || true
     chown -R dcc:dcc /var/dcc 2>/dev/null || true
     if [ ! -f /var/dcc/map ]; then
         echo "[DRP] DCC: creating server map"
-        su -s /bin/sh dcc -c '/var/dcc/bin/cdcc "new map; add dcc.dcc-servers.net"' \
+        su -s /bin/sh dcc -c 'cdcc "new map; add dcc.dcc-servers.net"' \
             2>/dev/null || true
     fi
 fi
