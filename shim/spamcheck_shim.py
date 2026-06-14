@@ -6,13 +6,23 @@ gets back one JSON object with the verdict of each network. The CLIs are run
 out-of-process so the rspamd event loop never blocks.
 
 Endpoints:
-  POST /check   body = raw message            -> JSON verdict (see below)
+  POST /check   body = raw message   -> JSON verdict (query only, never reports)
+  POST /report  body = raw message   -> report as SPAM to all three networks
+  POST /revoke  body = raw message   -> report as HAM (not-spam) where supported
   GET  /health  ->  200 "ok"  (used by the container HEALTHCHECK)
 
-Verdict JSON:
+/check is for scanners (rspamd plugin). /report and /revoke are for feedback —
+e.g. a Dovecot sieve that fires when a user moves a message to/from Junk. See
+dovecot/ in this repo for the client script + sieve examples.
+
+Verdict JSON (/check):
   { "dcc":   { "action": "reject"|"accept"|"unknown", "bulk": <int|null> },
     "razor": { "hit": true|false },
     "pyzor": { "count": <int>, "wl": <int> } }
+
+Report JSON (/report, /revoke):
+  { "dcc": true|false|null, "razor": true|false, "pyzor": true|false }
+  (null = backend not applicable, e.g. DCC has no network ham-revoke)
 
 Each backend is best-effort: a missing binary, timeout, or network error yields
 that backend's "unknown"/false/zero result rather than failing the whole check —
@@ -39,6 +49,8 @@ MAX_BODY = 8 * 1024 * 1024
 
 DCCPROC = os.environ.get("DCCPROC", "/usr/bin/dccproc")
 RAZOR_CHECK = os.environ.get("RAZOR_CHECK", "razor-check")
+RAZOR_REPORT = os.environ.get("RAZOR_REPORT", "razor-report")
+RAZOR_REVOKE = os.environ.get("RAZOR_REVOKE", "razor-revoke")
 PYZOR = os.environ.get("PYZOR", "pyzor")
 
 # dccproc -H prints an X-DCC header line, e.g.:
@@ -114,6 +126,35 @@ def verdict(msg):
     }
 
 
+def _ok(r):
+    """True if the CLI ran and exited 0; False on failure; None if missing."""
+    if r is None:
+        return None
+    rc, _, _ = r
+    return rc == 0
+
+
+def report(msg):
+    """Report the message as SPAM to all three networks."""
+    # DCC: dccproc WITHOUT -Q actually submits the checksums (raises counts).
+    dcc = _ok(_run([DCCPROC, "-H"], msg))
+    return {
+        "dcc": dcc,
+        "razor": _ok(_run([RAZOR_REPORT], msg)) or False,
+        "pyzor": _ok(_run([PYZOR, "report"], msg)) or False,
+    }
+
+
+def revoke(msg):
+    """Report the message as HAM (not-spam) where the network supports it.
+    DCC has no network un-report, so it is reported as null (skipped)."""
+    return {
+        "dcc": None,
+        "razor": _ok(_run([RAZOR_REVOKE], msg)) or False,
+        "pyzor": _ok(_run([PYZOR, "whitelist"], msg)) or False,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -133,7 +174,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found", "text/plain")
 
     def do_POST(self):
-        if self.path != "/check":
+        handler = {"/check": verdict, "/report": report, "/revoke": revoke}.get(self.path)
+        if handler is None:
             self._send(404, "not found", "text/plain")
             return
         length = int(self.headers.get("Content-Length", 0))
@@ -142,14 +184,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         msg = self.rfile.read(length)
         try:
-            self._send(200, json.dumps(verdict(msg)))
-        except Exception as e:  # never 500 the worker; log and return unknowns
-            self.log_error("check failed: %s", e)
-            self._send(200, json.dumps({
-                "dcc": {"action": "unknown", "bulk": None},
-                "razor": {"hit": False},
-                "pyzor": {"count": 0, "wl": 0},
-            }))
+            self._send(200, json.dumps(handler(msg)))
+        except Exception as e:  # never 500 the caller; log and return safe defaults
+            self.log_error("%s failed: %s", self.path, e)
+            if self.path == "/check":
+                self._send(200, json.dumps({
+                    "dcc": {"action": "unknown", "bulk": None},
+                    "razor": {"hit": False},
+                    "pyzor": {"count": 0, "wl": 0},
+                }))
+            else:
+                self._send(200, json.dumps({"dcc": None, "razor": False, "pyzor": False}))
 
     def log_message(self, fmt, *args):  # to stderr -> s6 captures it
         import sys

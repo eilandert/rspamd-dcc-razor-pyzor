@@ -1,0 +1,30 @@
+#!/bin/sh
+# drp-report — pipe a message to the rspamd-dcc-razor-pyzor shim for REPORTING
+# (not scanning). Meant to be invoked by Dovecot's sieve `pipe` (sieve_extprograms)
+# when a user moves mail to/from Junk. Reads the raw message on stdin.
+#
+#   drp-report report   -> report the message as SPAM to DCC/Razor/Pyzor
+#   drp-report revoke    -> report it as HAM (Razor/Pyzor; DCC has no un-report)
+#
+# Install on the DOVECOT host into sieve_pipe_bin_dir (e.g.
+# /usr/lib/dovecot/sieve-pipe/drp-report), chmod 0755. Point it at the backend:
+#   DRP_URL=http://rspamd-drp:8077   (default)
+#
+# Always exits 0: a reporting failure must never bounce mail or break the IMAP
+# move that triggered it.
+set -u
+
+ACTION="${1:-report}"
+DRP_URL="${DRP_URL:-http://rspamd-drp:8077}"
+
+case "$ACTION" in
+    report)      EP="$DRP_URL/report" ;;
+    revoke|ham)  EP="$DRP_URL/revoke" ;;
+    *) echo "usage: drp-report report|revoke" >&2; exit 0 ;;
+esac
+
+curl -fsS --max-time 10 \
+    -H "Content-Type: message/rfc822" \
+    --data-binary @- "$EP" >/dev/null 2>&1 || true
+
+exit 0

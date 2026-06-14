@@ -97,15 +97,57 @@ Restart rspamd. Symbols (scores in `groups.conf`, tune to taste):
 
 ## HTTP API
 
-`POST /check` with the raw RFC-822 message as the body → JSON:
+Body is always the raw RFC-822 message.
 
-```json
-{ "dcc":   { "action": "reject", "bulk": 2147483647 },
-  "razor": { "hit": true },
-  "pyzor": { "count": 42, "wl": 0 } }
+- `POST /check` — **query only** (never reports), used by the rspamd plugin → JSON:
+
+  ```json
+  { "dcc":   { "action": "reject", "bulk": 2147483647 },
+    "razor": { "hit": true },
+    "pyzor": { "count": 42, "wl": 0 } }
+  ```
+
+- `POST /report` — report the message as **spam** to all three networks → JSON:
+
+  ```json
+  { "dcc": true, "razor": true, "pyzor": true }
+  ```
+
+- `POST /revoke` — report as **ham** (Razor/Pyzor; DCC has no network un-report,
+  returns `null`).
+
+- `GET /health` → `200 ok` (used by the container HEALTHCHECK).
+
+## Reporting from Dovecot (sieve)
+
+`/check` is for the scanner. `/report` and `/revoke` are for **feedback** — when
+a user drags a message to Junk (spam) or rescues one out of it (ham). Sieve can't
+do HTTP, so [dovecot/drp-report](dovecot/drp-report) (a tiny `curl` wrapper)
+bridges the message to the shim, driven by imapsieve.
+
+On the **Dovecot host** (needs `curl` + `dovecot-sieve`):
+
+```
+cp dovecot/drp-report              /usr/lib/dovecot/sieve-pipe/drp-report   # chmod 0755
+cp dovecot/sieve/report-spam.sieve /usr/lib/dovecot/sieve/
+cp dovecot/sieve/report-ham.sieve  /usr/lib/dovecot/sieve/
+sievec /usr/lib/dovecot/sieve/report-spam.sieve
+sievec /usr/lib/dovecot/sieve/report-ham.sieve
+cp dovecot/90-drp-sieve.conf       /etc/dovecot/conf.d/
+# point the script at the backend (default http://rspamd-drp:8077):
+#   set DRP_URL in drp-report, or in the dovecot environment
+doveadm reload
 ```
 
-`GET /health` → `200 ok` (used by the container HEALTHCHECK).
+Behaviour ([90-drp-sieve.conf](dovecot/90-drp-sieve.conf)):
+
+| User action (IMAP) | Sieve | Shim call |
+|--------------------|-------|-----------|
+| move/copy **into** `Junk` | report-spam.sieve | `POST /report` (spam) |
+| move **out of** `Junk` | report-ham.sieve | `POST /revoke` (ham) |
+
+`drp-report` always exits 0 — a reporting failure never bounces mail or blocks
+the IMAP move.
 
 ## Build
 
