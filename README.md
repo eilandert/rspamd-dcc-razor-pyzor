@@ -233,7 +233,7 @@ is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 
 - Docker Hub: <https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor>
 - Monorepo: <https://github.com/eilandert/dockerized>
-- Article: _(TODO: add the deb.myguard.nl post link once published)_
+- Article: <https://deb.myguard.nl/2026/06/rspamd-dcc-razor-pyzor-docker-backend/>
 
 ## License
 
