@@ -54,7 +54,13 @@ RUN set -ex; \
     apt-get -y purge xz-utils; \
     apt-get -y autoremove; \
     apt-get -y clean autoclean; \
-    rm -rf /var/lib/apt/lists/* /var/cache/apt /usr/local/share/man
+    # Slim: drop docs/man/locale/info + perl pod + python bytecode caches. The
+    # interpreters (perl for razor, python for pyzor + the shim) are mandatory and
+    # can't be removed; this strips the dead weight that ships alongside them.
+    rm -rf /var/lib/apt/lists/* /var/cache/apt \
+           /usr/share/man /usr/local/share/man /usr/share/doc /usr/share/info \
+           /usr/share/locale/* /usr/share/perl*/*/pod; \
+    find /usr -depth -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
 # Project payload (shim + razor daemon + s6 service tree). The rspamd plugin
 # lives in the repo (../rspamd) for installing into a SEPARATE rspamd — the
