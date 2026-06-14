@@ -165,9 +165,9 @@ the IMAP move.
 docker build -f Dockerfile-deb -t eilandert/rspamd-dcc-razor-pyzor:latest .
 ```
 
-In the [dockerized](https://github.com/eilandert/dockerized) monorepo this
-builds via the buildx-bake target `debian-rspamd-drp` (external context
-`../rspamd-dcc-razor-pyzor`, same pattern as `../webtester`).
+In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo
+is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
+`docker buildx bake debian-rspamd-drp`.
 
 > **Packages:** `dcc`, `razor` and `pyzor` are installed from our own Debian
 > packages on [deb.myguard.nl](https://deb.myguard.nl) (the apt repo + signing
