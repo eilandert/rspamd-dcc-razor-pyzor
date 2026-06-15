@@ -1,7 +1,7 @@
 name: docker-integration
-# Manual: builds the real image (Go builder stage + dcc from deb.myguard.nl) and
-# smoke-tests the HTTP API. Needs the eilandert/debian-base image + the
-# deb.myguard.nl apt repo (for dcc), so it is not run on every push.
+# Manual: builds the real image (gozer Go builder stage, from the docker/gozer
+# submodule) and smoke-tests the HTTP API. Needs the eilandert/debian-base
+# image, so it is not run on every push.
 on:
   workflow_dispatch:
 
@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive   # gozer source for the image build
 
       - name: Pull base image
         run: docker pull eilandert/debian-base:stable

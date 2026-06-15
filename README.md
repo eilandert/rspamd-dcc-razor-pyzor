@@ -33,7 +33,9 @@ networks at once, with **no per-message subprocess forks at all**.
 
 The image is a single ~19 MB static `gozer` binary on a `distroless/static`
 base — no Debian, no s6 supervisor, no shell, no per-message fork. `gozer` is
-the container entrypoint and runs as `nonroot`. It queries the three networks
+the container entrypoint and runs as `nonroot`. Its source lives in its own
+repo, [eilandert/gozer](https://github.com/eilandert/gozer), pulled in here as
+the `docker/gozer` submodule and compiled by this repo's image build. It queries the three networks
 **concurrently**, all in-process, and caches verdicts (see
 [Configuration](#configuration)). All three talk to their servers directly
 (DCC needs no `dccifd` daemon). Every backend is **best-effort**: if one network
@@ -350,6 +352,7 @@ unchanged.
 - Docker Hub: <https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor>
 - Monorepo: <https://github.com/eilandert/dockerized>
 - Article: <https://deb.myguard.nl/2026/06/rspamd-dcc-razor-pyzor-docker-backend/>
+- gozer (the backend binary — its own repo, here as the `docker/gozer` submodule): <https://github.com/eilandert/gozer>
 - gazor (Razor client, imported in-process): <https://github.com/eilandert/gazor>
 - gyzor (Pyzor client, imported in-process): <https://github.com/eilandert/gyzor>
 - gdcc (DCC client, imported in-process): <https://github.com/eilandert/gdcc>

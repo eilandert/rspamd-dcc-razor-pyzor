@@ -1,4 +1,9 @@
 name: ci
+# The Go backend (gozer) has moved to its own repo, github.com/eilandert/gozer,
+# and is built/vetted/tested by that repo's CI. It is pulled in here as the
+# docker/gozer submodule. This workflow covers only what this repo owns: the
+# rspamd lua plugin. The full image build + HTTP smoke test lives in
+# docker.yml (workflow_dispatch — needs the base image + deb.myguard.nl).
 on:
   push:
     branches: [master, main]
@@ -7,75 +12,12 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: docker
-
 jobs:
-  go:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-          cache-dependency-path: docker/go.sum
-      - name: build
-        run: go build -mod=vendor ./...
-      - name: vet
-        run: go vet -mod=vendor ./...
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l cmd internal)
-          if [ -n "$unformatted" ]; then echo "gofmt needed on:"; echo "$unformatted"; exit 1; fi
-      - name: test (race)
-        run: go test -mod=vendor -race ./...
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-          cache-dependency-path: docker/go.sum
-      - name: staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          staticcheck ./...
-      - name: gosec
-        run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec ./...
-
   lua:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: .
     steps:
       - uses: actions/checkout@v5
       - name: luacheck
         # luacheck is not reliably apt-installable on the runner; use the
         # purpose-built image (reads the repo .luacheckrc).
         run: docker run --rm -v "$PWD":/data -w /data pipelinecomponents/luacheck:latest luacheck rspamd/plugins/
-
-  codeql:
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-    defaults:
-      run:
-        working-directory: .
-    steps:
-      - uses: actions/checkout@v5
-      - uses: github/codeql-action/init@v3
-        with:
-          languages: go
-          source-root: docker
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-          cache-dependency-path: docker/go.sum
-      - run: cd docker && go build -mod=vendor ./...
-      - uses: github/codeql-action/analyze@v3

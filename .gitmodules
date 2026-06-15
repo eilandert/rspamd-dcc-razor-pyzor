@@ -1,0 +1,3 @@
+[submodule "docker/gozer"]
+	path = docker/gozer
+	url = https://github.com/eilandert/gozer.git

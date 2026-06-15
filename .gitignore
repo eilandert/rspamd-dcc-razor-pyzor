@@ -1,6 +1,7 @@
 *.log
 *.tmp
-# built Go binary (compiled into the image; vendor/ IS committed for offline builds)
-/docker/gozer
+# gozer source lives in its own repo, pulled in as the docker/gozer submodule;
+# its built binary (docker/gozer/gozer) is ignored by that submodule's .gitignore
+# and is only ever compiled inside the image build.
 # local secrets (compose `secrets:` source) — never commit
 secrets/

@@ -15,12 +15,14 @@ ARG GO_VERSION=1.24
 
 # --- build stage: compile the static gozer binary (fully offline: deps are
 # vendored, so no module proxy / git fetch is needed) ---------------------------
+# gozer source comes from the docker/gozer submodule (its own repo,
+# github.com/eilandert/gozer). Build context is docker/, so it sits at gozer/.
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-COPY vendor/ ./vendor/
-COPY cmd/ ./cmd/
-COPY internal/ ./internal/
+COPY gozer/go.mod gozer/go.sum ./
+COPY gozer/vendor/ ./vendor/
+COPY gozer/cmd/ ./cmd/
+COPY gozer/internal/ ./internal/
 ARG GOZER_VERSION=dev
 RUN CGO_ENABLED=0 go build -mod=vendor -trimpath \
       -ldflags="-s -w -X main.version=${GOZER_VERSION}" \

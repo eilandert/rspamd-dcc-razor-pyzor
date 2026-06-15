@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # CI / local test runner for rspamd-dcc-razor-pyzor.
 #
-# The backend is a static Go binary (gozer) under docker/ that speaks Razor
-# (gazor) and Pyzor (gyzor) in-process and runs DCC via dccproc. Deps are
-# vendored, so all Go stages build offline.
+# The backend is a static Go binary (gozer) — its source lives in its own repo,
+# pulled in here as the docker/gozer submodule — that speaks Razor (gazor),
+# Pyzor (gyzor) and DCC (gdcc) all in-process. Deps are vendored, so all Go
+# stages build offline.
 #
 # Stages (each skipped with a notice if its tool is absent, so this runs in a
 # minimal env; CI installs the tools so nothing is skipped there):
@@ -23,22 +24,20 @@ rc=0
 note() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 skip() { printf '   (skip: %s)\n' "$*"; }
 
-# Run go in the module dir (docker/) regardless of the caller's cwd.
-go_() { (cd docker && go "$@"); }
+# Run go in the gozer module dir (docker/gozer submodule) regardless of cwd.
+go_() { (cd docker/gozer && go "$@"); }
 
 run_lint() {
     note "lint"
     if command -v shellcheck >/dev/null; then
         # SC1091: env files are sourced at runtime; not available to follow here.
-        shellcheck -s sh -e SC1091 docker/healthcheck.sh \
-            docker/root/etc/s6-overlay/scripts/init-bootstrap.sh \
-            docker/root/etc/s6-overlay/s6-rc.d/gozer/run \
-            dovecot/drp-report || rc=1
+        # (gozer is the distroless entrypoint now — no s6/healthcheck shell.)
+        shellcheck -s sh -e SC1091 dovecot/drp-report || rc=1
     else skip "shellcheck not installed"; fi
 
     if command -v go >/dev/null; then
         local unformatted
-        unformatted=$(cd docker && gofmt -l cmd internal)
+        unformatted=$(cd docker/gozer && gofmt -l cmd internal)
         if [ -n "$unformatted" ]; then
             echo "FAIL: gofmt needed on:"; echo "$unformatted"; rc=1
         fi
