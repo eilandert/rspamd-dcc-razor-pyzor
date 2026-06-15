@@ -56,10 +56,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: luacheck
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends luacheck
-          luacheck rspamd/plugins/
+        # luacheck is not reliably apt-installable on the runner; use the
+        # purpose-built image (reads the repo .luacheckrc).
+        run: docker run --rm -v "$PWD":/data -w /data pipelinecomponents/luacheck:latest luacheck rspamd/plugins/
 
   codeql:
     runs-on: ubuntu-latest
