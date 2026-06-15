@@ -123,8 +123,8 @@ func cmdServe(args []string) int {
 	cfg := gozer.LoadConfig()
 
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	fs.StringVar(&cfg.Host, "host", cfg.Host, "bind host (GOZER_HOST)")
-	fs.IntVar(&cfg.Port, "port", cfg.Port, "bind port (GOZER_PORT)")
+	fs.StringVar(&cfg.Host, "host", cfg.Host, "HTTP bind host (GOZER_HOST); serves /check,/report,/revoke,/metrics,/health")
+	fs.IntVar(&cfg.Port, "port", cfg.Port, "HTTP bind port (GOZER_PORT, default 8077)")
 	fs.DurationVar(&cfg.BackendTimeout, "backend-timeout", cfg.BackendTimeout, "per-request backend budget (GOZER_BACKEND_TIMEOUT)")
 	fs.IntVar(&cfg.MaxConcurrent, "max-concurrent", cfg.MaxConcurrent, "max in-flight requests (GOZER_MAX_CONCURRENT)")
 	fs.StringVar(&cfg.Token, "token", cfg.Token, "shared-secret for POST endpoints (GOZER_TOKEN[_FILE])")
