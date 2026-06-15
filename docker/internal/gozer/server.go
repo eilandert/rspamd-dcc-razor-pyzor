@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -34,16 +35,29 @@ type Server struct {
 	flights flightGroup
 	epochs  [256]atomic.Uint64
 	metrics *Metrics
+	info    *log.Logger // access/info — stdout when GOZER_LOG_STDOUT, else stderr
+	errl    *log.Logger // errors/warnings — always stderr
+}
+
+// newLoggers builds the info (stdout-toggle) and error (always-stderr) loggers.
+func newLoggers(cfg *Config) (info, errl *log.Logger) {
+	var infoW io.Writer = os.Stderr
+	if cfg.LogStdout {
+		infoW = os.Stdout
+	}
+	return log.New(infoW, "[gozer] ", 0), log.New(os.Stderr, "[gozer] ", 0)
 }
 
 // NewServer builds the server, its backends and its cache from cfg.
 func NewServer(cfg *Config) *Server {
 	cfg.sanitize() // re-clamp after any CLI-flag overlay so make(chan) can't panic
-	s := &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics()}
-	b := NewBackends(cfg, s.logf)
+	info, errl := newLoggers(cfg)
+	s := &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics(), info: info, errl: errl}
+	// Backend/cache diagnostics are mostly errors → route them to stderr.
+	b := NewBackends(cfg, s.errf)
 	b.metrics = s.metrics
 	s.engine = b
-	s.cache = NewCache(cfg, s.logf, s.metrics)
+	s.cache = NewCache(cfg, s.errf, s.metrics)
 	return s
 }
 
@@ -51,12 +65,18 @@ func NewServer(cfg *Config) *Server {
 // tests). A nil cache disables caching.
 func NewServerWithEngine(cfg *Config, engine Engine, cache Cache) *Server {
 	cfg.sanitize()
-	return &Server{cfg: cfg, engine: engine, cache: cache, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics()}
+	info, errl := newLoggers(cfg)
+	return &Server{cfg: cfg, engine: engine, cache: cache, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics(), info: info, errl: errl}
 }
 
+// logf writes an info/access line (stdout when GOZER_LOG_STDOUT is set).
 // #nosec G706 -- callers pass internal constant format strings; args are
 // numbers and JSON (encoding/json escapes control chars), never raw message bytes.
-func (s *Server) logf(format string, a ...any) { log.Printf("[gozer] "+format, a...) }
+func (s *Server) logf(format string, a ...any) { s.info.Printf(format, a...) }
+
+// errf writes an error/warning line — always to stderr regardless of the
+// stdout toggle, so a log shipper can separate and alert on the error stream.
+func (s *Server) errf(format string, a ...any) { s.errl.Printf(format, a...) }
 
 func (s *Server) vlogf(format string, a ...any) {
 	if s.cfg.Verbose {
@@ -84,7 +104,7 @@ func (s *Server) ListenAndServe() error {
 
 func (s *Server) logStartup(addr string) {
 	if s.cfg.Token == "" {
-		s.logf("WARNING: no GOZER_TOKEN configured — POST endpoints will refuse all " +
+		s.errf("WARNING: no GOZER_TOKEN configured — POST endpoints will refuse all " +
 			"requests (503). Set GOZER_TOKEN or GOZER_TOKEN_FILE.")
 	}
 	cache := "off"
@@ -155,7 +175,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	if !s.acquire() {
 		s.metrics.inc(&s.metrics.busyTotal)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
-		s.logf("%s 503 busy (max_concurrent=%d reached)", path, s.cfg.MaxConcurrent)
+		s.errf("%s 503 busy (max_concurrent=%d reached)", path, s.cfg.MaxConcurrent)
 		return
 	}
 	defer func() { <-s.sem }()
@@ -255,7 +275,7 @@ func (s *Server) acquire() bool {
 func (s *Server) dispatch(path string, msg []byte) (body []byte, cacheable bool) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			s.logf("%s backend panic: %v", path, rec)
+			s.errf("%s backend panic: %v", path, rec)
 			body = defaultJSON(path)
 			cacheable = false
 		}

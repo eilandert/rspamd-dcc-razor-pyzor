@@ -30,6 +30,12 @@ type Config struct {
 
 	Verbose bool // GOZER_VERBOSE
 
+	// LogStdout sends INFO/access logs to stdout instead of stderr
+	// (GOZER_LOG_STDOUT). Errors and warnings always go to stderr regardless, so
+	// a log shipper can separate the streams. Both are captured by Docker either
+	// way; this is about routability/alerting.
+	LogStdout bool // GOZER_LOG_STDOUT
+
 	// Backend wiring.
 	PyzorHome string // PYZOR_HOME (default /var/lib/pyzor)
 	RazorHome string // RAZORHOME  (default /var/lib/razor)
@@ -71,6 +77,7 @@ func LoadConfig() *Config {
 		RedisURL:       strings.TrimSpace(os.Getenv("GOZER_REDIS_URL")),
 		RedisPrefix:    envStr("GOZER_REDIS_PREFIX", "drp:check:"),
 		Verbose:        envBool("GOZER_VERBOSE"),
+		LogStdout:      envBool("GOZER_LOG_STDOUT"),
 		PyzorHome:      envStr("PYZOR_HOME", "/var/lib/pyzor"),
 		RazorHome:      envStr("RAZORHOME", "/var/lib/razor"),
 		MinCf:          envStr("RAZOR_MIN_CF", "ac"),

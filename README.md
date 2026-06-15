@@ -175,6 +175,7 @@ de-prefixed and hyphenated — e.g. `GOZER_MAX_CONCURRENT` ↔ `--max-concurrent
 | `GOZER_MAX_CONCURRENT` | `8` | Max in-flight requests (bounds backend fan-out). |
 | `GOZER_BACKEND_TIMEOUT` | `6` | Per-backend timeout in seconds. |
 | `GOZER_VERBOSE` | `0` (off) | Per-request logging — access line plus verdict, timing and cache hit/miss; also dumps the resolved config at startup. Off by default (only startup and errors are logged). |
+| `GOZER_LOG_STDOUT` | `0` (off) | Send **info/access** logs to stdout instead of stderr. **Errors and warnings always stay on stderr** so a log shipper can separate and alert on them. Both streams are captured by Docker regardless. |
 | `RAZOR_MIN_CF` | `ac` | Razor minimum confidence: `ac`, `ac+N`, `ac-N`, or a number. |
 | `DCC_SERVERS` / `GYZOR_SERVERS` / `GAZOR_DISCOVERY` | — | DNS-bypass server overrides forwarded to gdcc / gyzor / gazor (see above). |
 | `TZ` | — | Container timezone. |

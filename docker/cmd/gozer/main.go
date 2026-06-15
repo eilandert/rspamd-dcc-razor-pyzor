@@ -131,6 +131,7 @@ func cmdServe(args []string) int {
 	fs.DurationVar(&cfg.CacheTTL, "cache-ttl", cfg.CacheTTL, "verdict cache TTL, 0 disables (GOZER_CACHE_TTL)")
 	fs.IntVar(&cfg.CacheSize, "cache-size", cfg.CacheSize, "in-memory cache entries (GOZER_CACHE_SIZE)")
 	fs.BoolVar(&cfg.Verbose, "verbose", cfg.Verbose, "per-request + startup config logging (GOZER_VERBOSE)")
+	fs.BoolVar(&cfg.LogStdout, "log-stdout", cfg.LogStdout, "send info/access logs to stdout; errors stay on stderr (GOZER_LOG_STDOUT)")
 	fs.StringVar(&cfg.PyzorHome, "pyzor-home", cfg.PyzorHome, "pyzor home dir (PYZOR_HOME)")
 	fs.StringVar(&cfg.RazorHome, "razor-home", cfg.RazorHome, "razor home dir (RAZORHOME)")
 	fs.StringVar(&cfg.MinCf, "min-cf", cfg.MinCf, "razor min confidence (RAZOR_MIN_CF)")
