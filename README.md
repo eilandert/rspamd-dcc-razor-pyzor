@@ -22,13 +22,12 @@ networks at once, with **no per-message subprocess forks at all**.
 ## How it works
 
 ```
-  ┌──────────────────────┐   HTTP :8077 + token   ┌────────────────────────────┐
-  │  rspamd (your image)  │ ─────────────────────► │  rspamd-dcc-razor-pyzor     │
-  │  dcc_razor_pyzor.lua  │  POST /check (message) │  gozer  (distroless, nonroot)│
-  └──────────────────────┘ ◄───────────────────── │   ├─ gdcc   (DCC,   in-proc) │
-                              JSON verdict         │   ├─ gazor  (Razor, in-proc) │
-                                                   │   └─ gyzor  (Pyzor, in-proc) │
-                                                   └────────────────────────────┘
+  ┌─────────────────────┐    HTTP :8077 + token    ┌──────────────────────────────┐
+  │ rspamd (your image) │  ──── POST /check ───►   │  gozer  (distroless, nonroot)│
+  │ dcc_razor_pyzor.lua │                          │   ├─ gdcc   (DCC,   in-proc) │
+  │                     │  ◄─── JSON verdict ───   │   ├─ gazor  (Razor, in-proc) │
+  │                     │                          │   └─ gyzor  (Pyzor, in-proc) │
+  └─────────────────────┘                          └──────────────────────────────┘
 ```
 
 The image is a single ~19 MB static `gozer` binary on a `distroless/static`
@@ -114,19 +113,17 @@ taste):
 
 ## Identities
 
-Each network has an identity, auto-created on first boot and kept in the named
-volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
+Anonymous works for every network and is the default. The image carries **no
+writable state**, so nothing persists between restarts unless you mount it. To
+use a **known or shared identity**, supply it as below — Razor and DCC take
+credentials from the environment (every var also accepts a `<VAR>_FILE` form for
+Docker secrets), Pyzor reads a standard `accounts` file:
 
-| Network | Identity | Anonymous default |
-|---------|----------|-------------------|
-| Razor | account supplied via `RAZOR_USER`/`RAZOR_PASS` | yes (anonymous) |
-| DCC | `DCC_CLIENT_ID` + `DCC_CLIENT_PASSWD` (or `DCC_IDS`) | yes (anonymous id 1) |
-| Pyzor | optional accounts file under `PYZOR_HOME` | yes (anonymous to the public server) |
-
-Anonymous is fine for most setups. The image carries **no writable state**;
-to use a **known or shared identity**, provide it through the environment (every
-var also accepts a `<VAR>_FILE` form for Docker secrets — see
-[`docker/docker-compose.yml`](docker/docker-compose.yml)):
+| Network | How to authenticate | Anonymous default |
+|---------|---------------------|-------------------|
+| Razor | `RAZOR_USER` + `RAZOR_PASS` (or `_FILE`); obtain one with `gozer razor-register` | yes |
+| DCC | `DCC_CLIENT_ID` + `DCC_CLIENT_PASSWD` (or `_FILE`), or `DCC_IDS` | yes (id 1) |
+| Pyzor | mount a pyzor **`accounts` file** at `$PYZOR_HOME/accounts` — see below | yes |
 
 ```yaml
 environment:
@@ -135,6 +132,27 @@ environment:
   RAZOR_USER: "you@example.com"   # obtain one with `gozer razor-register`
   RAZOR_PASS: "…"
 ```
+
+**Pyzor authentication.** Unlike Razor and DCC, Pyzor has no credential env var —
+the in-process gyzor client loads accounts the reference-pyzor way, from an
+`accounts` file in its home dir (`PYZOR_HOME`, default `/var/lib/pyzor`). Mount
+one read-only; this works even with the container's `read_only: true` rootfs:
+
+```yaml
+environment:
+  PYZOR_HOME: /var/lib/pyzor       # default; shown for clarity
+volumes:
+  - ./pyzor-accounts:/var/lib/pyzor/accounts:ro
+```
+
+```
+# ./pyzor-accounts — one line per server: host : port : username : salt,key
+public.pyzor.org : 24441 : you@example.com : 0123abcd,4567ef89…
+```
+
+Generate the `salt,key` value with the stock `pyzor` tool from your passphrase;
+gyzor consumes it byte-for-byte. With no accounts file the Pyzor client is
+anonymous to the public server, which suits most setups.
 
 ### DNS-bypass server overrides
 
@@ -151,12 +169,13 @@ environment:
   GAZOR_DISCOVERY: "discovery.razor.cloudmark.com"              # → gazor (Razor), tried in order
 ```
 
-Resolution order per network: **explicit env → existing credential in the volume
-→ anonymous**. For Razor that means `RAZOR_USER`+`RAZOR_PASS` win, else the
-persisted `gazor-identity` file, else a fresh registration. Every credential
-variable also accepts a `<VAR>_FILE` form for
-Docker secrets — e.g. `RAZOR_REGISTER_PASS_FILE=/run/secrets/razor_pass` — so a
-secret never has to sit in the compose file.
+Resolution order per network: **explicit env → persisted identity file →
+anonymous**. For Razor that means `RAZOR_USER`+`RAZOR_PASS` win, else the
+`gazor-identity` file under `RAZORHOME` (if you mounted one); for Pyzor, the
+mounted `accounts` file, else anonymous. Credential variables also accept a
+`<VAR>_FILE` form for Docker secrets — e.g.
+`RAZOR_PASS_FILE=/run/secrets/razor_pass` — so a secret never has to sit in the
+compose file.
 
 ## Configuration
 
@@ -164,7 +183,9 @@ Every setting is a backend-container **environment variable** and also a
 **`gozer serve` CLI flag** (flag > env > default), so the same option works in
 compose or on the command line. The flag name is the env name lower-cased,
 de-prefixed and hyphenated — e.g. `GOZER_MAX_CONCURRENT` ↔ `--max-concurrent`,
-`GYZOR_SERVERS` ↔ `--pyzor-servers`.
+`GYZOR_SERVERS` ↔ `--pyzor-servers`. The full env/flag table and HTTP API are
+documented in the [gozer README](https://github.com/eilandert/gozer#configuration);
+the compose-relevant subset is below.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
