@@ -98,6 +98,15 @@ func (c *Client) resolve(srv Server) (*net.UDPAddr, error) {
 	return addr, nil
 }
 
+// invalidateAddr drops a cached address after a connection/I/O failure so the
+// next attempt re-resolves immediately instead of reusing a stale entry for the
+// rest of its TTL (e.g. a server that changed IP or went away).
+func (c *Client) invalidateAddr(srv Server) {
+	c.addrMu.Lock()
+	delete(c.addrCache, srv)
+	c.addrMu.Unlock()
+}
+
 func (c *Client) logf(format string, args ...interface{}) {
 	line := fmt.Sprintf(format, args...)
 	if c.Log != nil {
@@ -299,9 +308,25 @@ func (c *Client) exchange(ctx context.Context, stop <-chan struct{}, srv Server,
 	}
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
+		c.invalidateAddr(srv) // re-resolve next time instead of waiting out the TTL
 		return nil, fmt.Errorf("dial %s: %w", srv.Host, err)
 	}
 	defer conn.Close()
+
+	// Unblock an in-flight UDP read promptly when ctx is cancelled, even with no
+	// ctx deadline: a watcher trips the read deadline so readAnswer returns and
+	// the loop observes ctx.Done() instead of waiting out the bounded read.
+	if done := ctx.Done(); done != nil {
+		watchStop := make(chan struct{})
+		defer close(watchStop)
+		go func() {
+			select {
+			case <-done:
+				_ = conn.SetReadDeadline(time.Now())
+			case <-watchStop:
+			}
+		}()
+	}
 
 	pkt := buildQuery(op, sender, nums, tgts, cks, passwd)
 	// Retransmit cadence keys off Timeout; the hard stop is the passed deadline
@@ -325,6 +350,7 @@ func (c *Client) exchange(ctx context.Context, stop <-chan struct{}, srv Server,
 		signPacket(pkt, passwd)
 
 		if _, err := conn.Write(pkt); err != nil {
+			c.invalidateAddr(srv)
 			return nil, fmt.Errorf("send: %w", err)
 		}
 		c.vlogf("%s xmit %d to %s (%d checksums)", opName(op), xmit+1, srv.Host, n)
