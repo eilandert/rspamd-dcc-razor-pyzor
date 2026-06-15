@@ -17,6 +17,9 @@ type Cache interface {
 	Get(key string) ([]byte, bool)
 	// Put stores verdict bytes under key for the configured TTL.
 	Put(key string, val []byte)
+	// Delete invalidates a key so a stale /check verdict cannot survive a
+	// /report or /revoke of the same message.
+	Delete(key string)
 }
 
 // NewCache builds the cache backend for cfg. It returns nil (caching disabled)
@@ -104,6 +107,12 @@ func (c *memCache) Put(key string, val []byte) {
 	c.d[key] = memEntry{exp: now.Add(c.ttl), data: val}
 }
 
+func (c *memCache) Delete(key string) {
+	c.mu.Lock()
+	delete(c.d, key)
+	c.mu.Unlock()
+}
+
 // redisCache fronts a shared Redis L2 with the in-process memCache as an L1.
 // Every Redis call fails open: any error degrades to an L1 miss / no-store, so
 // a Redis outage falls back to direct backend calls rather than an error.
@@ -151,4 +160,11 @@ func (c *redisCache) Put(key string, val []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_ = c.rdb.Set(ctx, c.prefix+key, val, c.ttl).Err() // best effort
+}
+
+func (c *redisCache) Delete(key string) {
+	c.l1.Delete(key)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = c.rdb.Del(ctx, c.prefix+key).Err() // best effort (shared L2 invalidation)
 }

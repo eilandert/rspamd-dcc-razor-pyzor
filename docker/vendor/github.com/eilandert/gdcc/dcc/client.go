@@ -257,7 +257,7 @@ func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint3
 		if waitUntil.After(deadline) {
 			waitUntil = deadline
 		}
-		counts, err := c.readAnswer(stop, conn, n, nums, waitUntil)
+		counts, err := c.readAnswer(stop, conn, n, nums, passwd, waitUntil)
 		if err == nil {
 			return counts, nil
 		}
@@ -274,7 +274,7 @@ func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint3
 
 // readAnswer reads datagrams until a matching answer arrives or the deadline
 // passes. Stray/late datagrams (wrong transaction id) are skipped.
-func (c *Client) readAnswer(stop <-chan struct{}, conn *net.UDPConn, n uint32, nums opNums, until time.Time) ([]answerCount, error) {
+func (c *Client) readAnswer(stop <-chan struct{}, conn *net.UDPConn, n uint32, nums opNums, passwd []byte, until time.Time) ([]answerCount, error) {
 	buf := make([]byte, 2048)
 	for {
 		select {
@@ -299,6 +299,14 @@ func (c *Client) readAnswer(stop <-chan struct{}, conn *net.UDPConn, n uint32, n
 		}
 		if err != nil {
 			return nil, err
+		}
+		// For an authenticated client the server signs the answer with our
+		// password; an answer that does not verify is spoofed or corrupt — skip
+		// it and keep waiting (a genuine answer may still arrive) rather than
+		// trusting its counts. Anonymous answers carry a zero signature and pass.
+		if !verifyAnswerSig(buf[:rn], passwd) {
+			c.vlogf("answer from server failed signature verification; ignoring")
+			continue
 		}
 		return counts, nil
 	}

@@ -485,16 +485,24 @@ func (c *Client) sendReport(parts []*part, headers []byte, dre int) error {
 		return err
 	}
 
-	// Only send the full message if the server asked (err=230).
-	wants := false
+	// Send only the parts the server actually asked for (err=230). Mark every
+	// other part skipped so buildReportChunks uploads exactly the requested
+	// parts — Core.pm marks each non-wanted part skipped before make_query, so
+	// uploading all non-skip parts would disclose body parts the server has and
+	// diverge from the reference protocol.
+	wanted := make(map[*part]bool, len(order))
 	for _, p := range order {
 		if len(p.resp) > 0 && p.resp[0]["err"] == "230" {
-			wants = true
-			break
+			wanted[p] = true
 		}
 	}
-	if !wants {
-		return nil
+	if len(wanted) == 0 {
+		return nil // server already has every part; nothing to upload
+	}
+	for _, p := range parts {
+		if !wanted[p] {
+			p.skip = true
+		}
 	}
 	// Pack the report into one or more chunks (headers + as many part bodies as
 	// fit under bqs), never truncating; submit each and validate the server's
@@ -516,13 +524,25 @@ func (c *Client) sendReport(parts []*part, headers []byte, dre int) error {
 // rcheck_resp): a non-230 err, or res=0, means the server did not accept the
 // submission. err=230 ("wants mail") and res=1 ("accepted") are success.
 func checkReportResp(responses []string) error {
+	if len(responses) == 0 {
+		return errors.New("empty report response")
+	}
 	for _, r := range responses {
-		for _, h := range fromBatchedQuery(strings.TrimSuffix(r, ".\r\n")) {
+		hs := fromBatchedQuery(strings.TrimSuffix(r, ".\r\n"))
+		if len(hs) == 0 {
+			return errors.New("malformed report response (no fields)")
+		}
+		for _, h := range hs {
 			if e, ok := h["err"]; ok && e != "230" {
 				return fmt.Errorf("server returned err %s", e)
 			}
 			if h["res"] == "0" {
 				return errors.New("server did not accept the report")
+			}
+			// An empty/field-less ack must not pass as success: require an
+			// explicit recognized success marker (res=1, or err=230 "wants mail").
+			if h["res"] != "1" && h["err"] != "230" {
+				return errors.New("report response missing a success result (res=1 / err=230)")
 			}
 		}
 	}
@@ -828,12 +848,28 @@ func (c *Client) computeMinCf() int {
 // --- low-level network ---
 
 func (c *Client) dial(server string) (net.Conn, *bufio.Reader, error) {
-	addr := net.JoinHostPort(server, strconv.Itoa(c.port()))
-	conn, err := net.DialTimeout("tcp", addr, c.timeout())
+	conn, err := net.DialTimeout("tcp", c.serverAddr(server), c.timeout())
 	if err != nil {
 		return nil, nil, err
 	}
 	return conn, bufio.NewReader(conn), nil
+}
+
+// serverAddr resolves a server entry to a dial address. An entry that already
+// carries a port (host:port, [ipv6]:port) is used verbatim; otherwise the
+// default port is applied. This lets --server / --discovery / Discoveries
+// entries pin an explicit port (e.g. 127.0.0.1:2703 for a DNS-bypass) instead
+// of always re-wrapping the global port — which produced the bogus host
+// "127.0.0.1:2703" and broke the lookup.
+func (c *Client) serverAddr(server string) string {
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server // already host:port (or [ipv6]:port)
+	}
+	host := server
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		host = server[1 : len(server)-1] // bracketed IPv6 without a port
+	}
+	return net.JoinHostPort(host, strconv.Itoa(c.port()))
 }
 
 func (c *Client) disconnect() {
@@ -894,10 +930,31 @@ func (c *Client) writeMsg(m string) error {
 	return err
 }
 
+// readLineLimited reads up to and including the next '\n', but bounds the line
+// at max bytes so a malicious server cannot make ReadString allocate an
+// unbounded line that has no newline (the size guards downstream only run AFTER
+// ReadString returns). ReadByte is buffered, so this stays cheap.
+func readLineLimited(br *bufio.Reader, max int) (string, error) {
+	var sb strings.Builder
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return sb.String(), err
+		}
+		_ = sb.WriteByte(b)
+		if b == '\n' {
+			return sb.String(), nil
+		}
+		if sb.Len() > max {
+			return sb.String(), fmt.Errorf("line exceeded %d bytes", max)
+		}
+	}
+}
+
 // readGreeting reads the single-line server greeting and parses it.
 func readGreeting(conn net.Conn, br *bufio.Reader, timeout time.Duration) (map[string]string, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	line, err := br.ReadString('\n')
+	line, err := readLineLimited(br, maxResponseBytes)
 	if err != nil && line == "" {
 		return nil, err
 	}
@@ -923,7 +980,7 @@ func readResponse(conn net.Conn, br *bufio.Reader, timeout time.Duration) (strin
 			rd = deadline
 		}
 		_ = conn.SetReadDeadline(rd)
-		chunk, err := br.ReadString('\n')
+		chunk, err := readLineLimited(br, maxResponseBytes)
 		if chunk != "" {
 			sb.WriteString(chunk)
 			first = false

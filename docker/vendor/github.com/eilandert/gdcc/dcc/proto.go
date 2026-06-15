@@ -1,6 +1,7 @@
 package dcc
 
 import (
+	"crypto/hmac"
 	"crypto/md5" // #nosec G501 -- DCC wire protocol mandates MD5; not a security primitive here
 	"encoding/binary"
 	"errors"
@@ -94,6 +95,25 @@ func signPacket(buf, passwd []byte) {
 	h.Write(passwd)
 	h.Write(buf[:len(buf)-sigLen])
 	copy(sig, h.Sum(nil))
+}
+
+// verifyAnswerSig checks a server answer's trailing 16-byte signature. For an
+// authenticated client the server keys the signature on the client password
+// (MD5(passwd || msg[:-16]), the same construction as signPacket), and the
+// reference client rejects an answer that does not verify — without this a
+// spoofed UDP reply could inject arbitrary counts. Anonymous clients (empty
+// passwd) get a zero signature with nothing to key on, so they pass.
+func verifyAnswerSig(buf, passwd []byte) bool {
+	if len(passwd) == 0 {
+		return true // anonymous: nothing to verify
+	}
+	if len(buf) < sigLen {
+		return false
+	}
+	h := md5.New() // #nosec G401 -- DCC packet signature is keyed MD5 by protocol
+	h.Write(passwd)
+	h.Write(buf[:len(buf)-sigLen])
+	return hmac.Equal(h.Sum(nil), buf[len(buf)-sigLen:]) // constant-time
 }
 
 // passwd16 pads/truncates a password to the fixed 16-byte field the signature

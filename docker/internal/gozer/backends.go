@@ -120,7 +120,7 @@ func (b *Backends) razorClient() *razor.Client {
 // the non-spam/unknown value rather than a bare zero value.
 func (b *Backends) Check(msg []byte) Verdict {
 	v := DefaultVerdict()
-	runParallel(
+	b.runParallel(
 		func() { v.DCC = b.checkDCC(msg) },
 		func() { v.Razor = b.checkRazor(msg) },
 		func() { v.Pyzor = b.checkPyzor(msg) },
@@ -131,7 +131,7 @@ func (b *Backends) Check(msg []byte) Verdict {
 // Report submits the message as spam to all three networks concurrently.
 func (b *Backends) Report(msg []byte) ReportResult {
 	var r ReportResult
-	runParallel(
+	b.runParallel(
 		func() { r.DCC = b.reportDCC(msg) },
 		func() { r.Razor = b.reportRazor(msg) },
 		func() { r.Pyzor = b.pyzor.Report(msg) },
@@ -143,7 +143,7 @@ func (b *Backends) Report(msg []byte) ReportResult {
 // network un-report, so dcc is always null.
 func (b *Backends) Revoke(msg []byte) ReportResult {
 	var r ReportResult // r.DCC stays nil -> JSON null
-	runParallel(
+	b.runParallel(
 		func() { r.Razor = b.revokeRazor(msg) },
 		func() { r.Pyzor = b.pyzor.Whitelist(msg) },
 	)
@@ -278,22 +278,32 @@ func (b *Backends) checkPyzor(msg []byte) PyzorResult {
 	// unreachable servers, so there is no error path here.
 	res := b.pyzor.Check(msg)
 	if !res.AllOK() {
-		b.metrics.backendError("pyzor") // at least one server failed/unreachable
+		// Incomplete evidence: reference Pyzor requires every configured server
+		// to answer before a count is authoritative. Return a zero score rather
+		// than a partial max that could insert DRP_PYZOR on one server's reply.
+		b.metrics.backendError("pyzor")
+		return PyzorResult{}
 	}
 	return PyzorResult{Count: res.Count, WL: res.Whitelist}
 }
 
 // runParallel runs fns concurrently and waits for all to finish. Each fn is
-// guarded by a recover so a panicking backend never crashes gozer or aborts
-// its siblings; the panicking backend simply leaves its result at the seeded
-// default (fail-open).
-func runParallel(fns ...func()) {
+// guarded by a recover so a panicking backend never crashes gozer or aborts its
+// siblings; the panicking backend simply leaves its result at the seeded default
+// (fail-open). A recovered panic is logged AND counted (gozer_error_total) so it
+// is observable rather than silently swallowed.
+func (b *Backends) runParallel(fns ...func()) {
 	var wg sync.WaitGroup
 	wg.Add(len(fns))
 	for _, fn := range fns {
 		go func(f func()) {
 			defer wg.Done()
-			defer func() { _ = recover() }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					b.logf("backend panic recovered (fail-open): %v", rec)
+					b.metrics.inc(&b.metrics.errorTotal)
+				}
+			}()
 			f()
 		}(fn)
 	}

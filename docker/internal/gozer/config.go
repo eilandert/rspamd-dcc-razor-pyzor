@@ -6,6 +6,7 @@
 package gozer
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -80,7 +81,38 @@ func LoadConfig() *Config {
 		DCCClientPass:  envOrFile("DCC_CLIENT_PASSWD"),
 	}
 	c.RazorUser, c.RazorPass = loadIdentity(c.RazorHome)
+	c.sanitize()
 	return c
+}
+
+// sanitize clamps invalid numeric configuration to safe defaults so a bad env
+// value cannot disable the service (GOZER_MAX_CONCURRENT=0 → every request 503)
+// or crash it (a negative concurrency panics make(chan), an out-of-range port
+// fails to bind). Each clamp is logged so the operator sees the override.
+func (c *Config) sanitize() {
+	clamp := func(name string, got, def int) int {
+		log.Printf("[gozer] WARNING: invalid %s=%d; using %d", name, got, def)
+		return def
+	}
+	if c.MaxConcurrent < 1 {
+		c.MaxConcurrent = clamp("GOZER_MAX_CONCURRENT", c.MaxConcurrent, 8)
+	}
+	if c.Port < 1 || c.Port > 65535 {
+		c.Port = clamp("GOZER_PORT", c.Port, 8077)
+	}
+	if c.BackendTimeout <= 0 {
+		log.Printf("[gozer] WARNING: invalid GOZER_BACKEND_TIMEOUT=%s; using 6s", c.BackendTimeout)
+		c.BackendTimeout = 6 * time.Second
+	}
+	if c.MaxBody <= 0 {
+		c.MaxBody = 8 * 1024 * 1024
+	}
+	if c.CacheSize < 1 {
+		c.CacheSize = 4096
+	}
+	if c.CacheTTL < 0 {
+		c.CacheTTL = 0 // negative is nonsensical; 0 disables the cache
+	}
 }
 
 // IdentityFile is the path of the persisted razor credential inside RazorHome.

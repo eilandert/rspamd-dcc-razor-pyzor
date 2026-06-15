@@ -36,6 +36,7 @@ type Server struct {
 
 // NewServer builds the server, its backends and its cache from cfg.
 func NewServer(cfg *Config) *Server {
+	cfg.sanitize() // re-clamp after any CLI-flag overlay so make(chan) can't panic
 	s := &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics()}
 	b := NewBackends(cfg, s.logf)
 	b.metrics = s.metrics
@@ -47,6 +48,7 @@ func NewServer(cfg *Config) *Server {
 // NewServerWithEngine builds a server around a supplied engine and cache (for
 // tests). A nil cache disables caching.
 func NewServerWithEngine(cfg *Config, engine Engine, cache Cache) *Server {
+	cfg.sanitize()
 	return &Server{cfg: cfg, engine: engine, cache: cache, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics()}
 }
 
@@ -67,6 +69,12 @@ func (s *Server) ListenAndServe() error {
 		Addr:              addr,
 		Handler:           s,
 		ReadHeaderTimeout: 10 * time.Second, // Slowloris guard
+		// Bound a slow client holding the body or the response: a request must
+		// arrive and be answered within the backend budget plus slack, and idle
+		// keep-alive connections are reaped.
+		ReadTimeout:  s.cfg.BackendTimeout + 20*time.Second,
+		WriteTimeout: s.cfg.BackendTimeout + 25*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 	s.logStartup(addr)
 	return srv.ListenAndServe()
@@ -130,12 +138,28 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	s.metrics.incPath(path)
 
+	// Validate the declared length cheaply (no read yet) — reject anything
+	// missing, non-positive, or over the body cap.
 	length, err := strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
 	if err != nil || length <= 0 || length > s.cfg.MaxBody {
 		s.metrics.inc(&s.metrics.errorTotal)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad length"})
 		return
 	}
+
+	// Acquire a concurrency slot BEFORE buffering the (up to MaxBody) body, so a
+	// burst of large uploads cannot hold unbounded goroutines/memory while never
+	// consuming a slot. Each request opens razor/pyzor/DCC sockets downstream.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-time.After(s.cfg.BackendTimeout):
+		s.metrics.inc(&s.metrics.busyTotal)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
+		s.logf("%s 503 busy (max_concurrent=%d reached)", path, s.cfg.MaxConcurrent)
+		return
+	}
+
 	msg, err := io.ReadAll(io.LimitReader(r.Body, length))
 	if err != nil {
 		s.metrics.inc(&s.metrics.errorTotal)
@@ -145,10 +169,13 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	t0 := time.Now()
 	defer s.metrics.observeSince(t0)
 
-	// /check is a cacheable idempotent query; /report and /revoke never cache.
+	// /check is a cacheable idempotent query; /report and /revoke never cache and
+	// invalidate any cached /check verdict for the same message.
 	var cacheKey string
-	if path == "/check" && s.cache != nil {
+	if s.cache != nil {
 		cacheKey = sha256hex(msg)
+	}
+	if path == "/check" && cacheKey != "" {
 		if hit, found := s.cache.Get(cacheKey); found {
 			s.metrics.inc(&s.metrics.cacheHit)
 			w.Header().Set("Content-Type", "application/json")
@@ -162,21 +189,13 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		s.metrics.inc(&s.metrics.cacheMiss)
 	}
 
-	// Bound in-flight requests: each can fork dccproc and open razor/pyzor
-	// sockets, so an unbounded server would be a fork/socket storm under load.
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-time.After(s.cfg.BackendTimeout):
-		s.metrics.inc(&s.metrics.busyTotal)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
-		s.logf("%s 503 busy (max_concurrent=%d reached)", path, s.cfg.MaxConcurrent)
-		return
-	}
-
 	body := s.dispatch(path, msg)
-	if cacheKey != "" {
+	switch {
+	case path == "/check" && cacheKey != "":
 		s.cache.Put(cacheKey, body)
+	case (path == "/report" || path == "/revoke") && cacheKey != "":
+		// the message's spam status just changed — drop the stale /check verdict
+		s.cache.Delete(cacheKey)
 	}
 	writeRaw(w, http.StatusOK, "application/json", body)
 
