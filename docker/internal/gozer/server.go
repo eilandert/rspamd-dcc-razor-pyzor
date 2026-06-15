@@ -144,6 +144,10 @@ func isBackendPath(p string) bool {
 	return p == "/check" || p == "/report" || p == "/revoke"
 }
 
+// maxBodyHardLimit is a constant ceiling on a request body, well above any
+// MaxBody, so the int(length) conversion in handlePost is provably bounded.
+const maxBodyHardLimit = 1 << 30 // 1 GiB
+
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	// Auth: fail closed if no token is configured (503), reject a wrong/absent
 	// token (401). The backend never runs unauthenticated.
@@ -161,9 +165,11 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	s.metrics.incPath(path)
 
 	// Validate the declared length cheaply (no read yet) — reject anything
-	// missing, non-positive, or over the body cap.
+	// missing, non-positive, or over the body cap. The constant ceiling also
+	// lets the static analyzer prove the int(length) conversion below cannot
+	// overflow on a 32-bit build (MaxBody is far smaller, but it is a variable).
 	length, err := strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
-	if err != nil || length <= 0 || length > s.cfg.MaxBody {
+	if err != nil || length <= 0 || length > s.cfg.MaxBody || length > maxBodyHardLimit {
 		s.metrics.inc(&s.metrics.errorTotal)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad length"})
 		return

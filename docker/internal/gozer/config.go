@@ -84,7 +84,7 @@ func LoadConfig() *Config {
 		PyzorServers:   strings.TrimSpace(os.Getenv("GYZOR_SERVERS")),
 		RazorDiscovery: strings.TrimSpace(os.Getenv("GAZOR_DISCOVERY")),
 		DCCServers:     strings.TrimSpace(os.Getenv("DCC_SERVERS")),
-		DCCClientID:    uint32(envInt("DCC_CLIENT_ID", 0)), // #nosec G115 -- client-id is a 32-bit DCC field
+		DCCClientID:    envUint32("DCC_CLIENT_ID", 0), // parsed directly as uint32, no truncation
 		DCCClientPass:  envOrFile("DCC_CLIENT_PASSWD"),
 	}
 	c.RazorUser, c.RazorPass = loadIdentity(c.RazorHome)
@@ -186,6 +186,15 @@ func envStr(name, def string) string {
 func envInt(name string, def int) int {
 	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil {
 		return n
+	}
+	return def
+}
+
+// envUint32 parses an env var directly as a 32-bit unsigned int (ParseUint with
+// bitSize 32), so the result never truncates a wider value into uint32.
+func envUint32(name string, def uint32) uint32 {
+	if n, err := strconv.ParseUint(strings.TrimSpace(os.Getenv(name)), 10, 32); err == nil {
+		return uint32(n)
 	}
 	return def
 }
