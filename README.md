@@ -211,6 +211,26 @@ token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
   `gozer_latency_seconds` histogram. `gozer stats` fetches and prints it locally
   (the image ships no curl).
 
+### Example
+
+POST the raw message as the body — `--data-binary` keeps the bytes intact (the
+fingerprints are computed over them). From a container on the same network (or
+the host if you published the port):
+
+```sh
+TOKEN=$(cat docker/secrets/drp_token.txt)
+
+# scan
+curl -s --data-binary @message.eml \
+  -H "Authorization: Bearer $TOKEN" http://rspamd-drp:8077/check
+# {"dcc":{"action":"unknown","bulk":null},"razor":{"hit":false},"pyzor":{"count":42,"wl":0}}
+
+# user feedback (X-DRP-Token works in place of the Bearer header)
+curl -s --data-binary @spam.eml -H "X-DRP-Token: $TOKEN" http://rspamd-drp:8077/report
+curl -s --data-binary @ham.eml  -H "X-DRP-Token: $TOKEN" http://rspamd-drp:8077/revoke
+curl -s http://rspamd-drp:8077/metrics      # no auth
+```
+
 ## Reporting from Dovecot (sieve)
 
 `/check` is for scanning. `/report` and `/revoke` are for **user feedback** —
