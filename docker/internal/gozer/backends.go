@@ -115,17 +115,18 @@ func (b *Backends) razorClient() *razor.Client {
 	}
 }
 
-// Check queries all three networks concurrently. It seeds the safe defaults so
-// a backend that panics (recovered in runParallel) leaves its sub-verdict at
-// the non-spam/unknown value rather than a bare zero value.
-func (b *Backends) Check(msg []byte) Verdict {
+// Check queries all three networks concurrently. healthy is true only when all
+// three returned authoritative results; degraded fail-open verdicts must not be
+// stored in the long-lived /check cache.
+func (b *Backends) Check(msg []byte) (Verdict, bool) {
 	v := DefaultVerdict()
+	var healthy [3]bool
 	b.runParallel(
-		func() { v.DCC = b.checkDCC(msg) },
-		func() { v.Razor = b.checkRazor(msg) },
-		func() { v.Pyzor = b.checkPyzor(msg) },
+		func() { v.DCC, healthy[0] = b.checkDCC(msg) },
+		func() { v.Razor, healthy[1] = b.checkRazor(msg) },
+		func() { v.Pyzor, healthy[2] = b.checkPyzor(msg) },
 	)
-	return v
+	return v, healthy[0] && healthy[1] && healthy[2]
 }
 
 // Report submits the message as spam to all three networks concurrently.
@@ -152,16 +153,16 @@ func (b *Backends) Revoke(msg []byte) ReportResult {
 
 // --- DCC (gdcc, in-process) ---
 
-func (b *Backends) checkDCC(msg []byte) DCCResult {
+func (b *Backends) checkDCC(msg []byte) (DCCResult, bool) {
 	res, err := b.dcc.Check(msg)
 	if err != nil {
 		b.metrics.backendError("dcc")
-		return DCCResult{Action: "unknown"} // gdcc already logged the error
+		return DCCResult{Action: "unknown"}, false // gdcc already logged the error
 	}
 	// A body checksum at DCC "many" rejects (matches dccproc's default
 	// threshold); a server whitelist accepts; otherwise no opinion.
 	v := res.Verdict()
-	return DCCResult{Action: v.Action.String(), Bulk: v.Bulk}
+	return DCCResult{Action: v.Action.String(), Bulk: v.Bulk}, true
 }
 
 func (b *Backends) reportDCC(msg []byte) *bool {
@@ -241,13 +242,13 @@ func splitCommaList(spec string) []string {
 
 // --- Razor (gazor, in-process) ---
 
-func (b *Backends) checkRazor(msg []byte) RazorResult {
+func (b *Backends) checkRazor(msg []byte) (RazorResult, bool) {
 	hit, err := b.razorClient().Check(msg)
 	if err != nil {
 		b.metrics.backendError("razor")
-		return RazorResult{Hit: false} // gazor already logged the error
+		return RazorResult{Hit: false}, false // gazor already logged the error
 	}
-	return RazorResult{Hit: hit}
+	return RazorResult{Hit: hit}, true
 }
 
 func (b *Backends) reportRazor(msg []byte) bool {
@@ -272,7 +273,7 @@ func (b *Backends) revokeRazor(msg []byte) bool {
 
 // --- Pyzor (gyzor, in-process) ---
 
-func (b *Backends) checkPyzor(msg []byte) PyzorResult {
+func (b *Backends) checkPyzor(msg []byte) (PyzorResult, bool) {
 	// gyzor aggregates across servers (Count/Whitelist are the max across
 	// successful servers, the pyzor-correct semantics) and degrades to zero on
 	// unreachable servers, so there is no error path here.
@@ -282,9 +283,9 @@ func (b *Backends) checkPyzor(msg []byte) PyzorResult {
 		// to answer before a count is authoritative. Return a zero score rather
 		// than a partial max that could insert DRP_PYZOR on one server's reply.
 		b.metrics.backendError("pyzor")
-		return PyzorResult{}
+		return PyzorResult{}, false
 	}
-	return PyzorResult{Count: res.Count, WL: res.Whitelist}
+	return PyzorResult{Count: res.Count, WL: res.Whitelist}, true
 }
 
 // runParallel runs fns concurrently and waits for all to finish. Each fn is
@@ -293,19 +294,27 @@ func (b *Backends) checkPyzor(msg []byte) PyzorResult {
 // (fail-open). A recovered panic is logged AND counted (gozer_error_total) so it
 // is observable rather than silently swallowed.
 func (b *Backends) runParallel(fns ...func()) {
+	if len(fns) == 0 {
+		return
+	}
 	var wg sync.WaitGroup
-	wg.Add(len(fns))
-	for _, fn := range fns {
+	wg.Add(len(fns) - 1)
+	for _, fn := range fns[1:] {
 		go func(f func()) {
 			defer wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil {
-					b.logf("backend panic recovered (fail-open): %v", rec)
-					b.metrics.inc(&b.metrics.errorTotal)
-				}
-			}()
-			f()
+			b.runGuarded(f)
 		}(fn)
 	}
+	b.runGuarded(fns[0])
 	wg.Wait()
+}
+
+func (b *Backends) runGuarded(fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			b.logf("backend panic recovered (fail-open): %v", rec)
+			b.metrics.inc(&b.metrics.errorTotal)
+		}
+	}()
+	fn()
 }

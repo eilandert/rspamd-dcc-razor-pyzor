@@ -7,6 +7,7 @@ package razor
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -280,9 +281,10 @@ func (c *Client) prepare(mail []byte) []*part {
 // computeSigs ports Core.pm compute_sigs: preproc each part (VR8 then VR4),
 // apply the empty-part skip rules, then compute the engine signatures.
 func (c *Client) computeSigs(parts []*part, ep4 string) {
+	engines := c.sortedEngines()
 	for _, p := range parts {
-		p.cleanedVR8 = managerVR8.preproc(append([]byte{}, p.body...))
-		p.cleaned = managerVR4.preproc(append([]byte{}, p.body...))
+		p.cleanedVR8 = managerVR8.preproc(p.body)
+		p.cleaned = managerVR4.preproc(p.body)
 		clen := len(p.cleanedVR8)
 
 		switch {
@@ -296,7 +298,7 @@ func (c *Client) computeSigs(parts []*part, ep4 string) {
 		if p.skip {
 			continue
 		}
-		for _, e := range c.sortedEngines() {
+		for _, e := range engines {
 			switch e {
 			case 4:
 				if s := vr4Signature(p.cleaned, ep4); s != "" {
@@ -1032,4 +1034,30 @@ func atoiDefault(s string, def int) int {
 	return def
 }
 
-func normalizeCRLF(b []byte) []byte { return reCRLF.ReplaceAll(b, []byte("\n")) }
+func normalizeCRLF(b []byte) []byte {
+	first := bytes.Index(b, []byte("\r\n"))
+	if first < 0 {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	out = append(out, b[:first]...)
+	for i := first; i < len(b); {
+		if b[i] != '\r' {
+			out = append(out, b[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(b) && b[j] == '\r' {
+			j++
+		}
+		if j < len(b) && b[j] == '\n' {
+			out = append(out, '\n')
+			i = j + 1
+			continue
+		}
+		out = append(out, b[i:j]...)
+		i = j
+	}
+	return out
+}

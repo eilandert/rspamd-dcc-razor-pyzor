@@ -3,9 +3,9 @@ package gozer
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -16,13 +16,14 @@ import (
 // per-backend errors and a request-latency histogram, and renders the text
 // format at /metrics.
 type Metrics struct {
-	checkTotal  uint64
-	reportTotal uint64
-	revokeTotal uint64
-	errorTotal  uint64 // request-level errors (busy, bad request)
-	busyTotal   uint64
-	cacheHit    uint64
-	cacheMiss   uint64
+	checkTotal     uint64
+	reportTotal    uint64
+	revokeTotal    uint64
+	errorTotal     uint64 // request-level errors (busy, bad request)
+	busyTotal      uint64
+	cacheHit       uint64
+	cacheMiss      uint64
+	cacheCoalesced uint64
 
 	backendErr struct {
 		dcc   uint64
@@ -30,10 +31,9 @@ type Metrics struct {
 		pyzor uint64
 	}
 
-	mu      sync.Mutex
 	buckets []float64
 	bcounts []uint64
-	sum     float64
+	sumBits uint64
 	count   uint64
 }
 
@@ -85,15 +85,14 @@ func (m *Metrics) observe(seconds float64) {
 	if m == nil {
 		return
 	}
-	m.mu.Lock()
 	for i, b := range m.buckets {
 		if seconds <= b {
-			m.bcounts[i]++
+			atomic.AddUint64(&m.bcounts[i], 1)
+			break
 		}
 	}
-	m.sum += seconds
-	m.count++
-	m.mu.Unlock()
+	atomicAddFloat64(&m.sumBits, seconds)
+	atomic.AddUint64(&m.count, 1)
 }
 
 // ServeHTTP renders the Prometheus text exposition.
@@ -113,23 +112,36 @@ func (m *Metrics) write(w io.Writer) {
 	counter("gozer_busy_total", "Requests rejected because max_concurrent was reached.", atomic.LoadUint64(&m.busyTotal))
 	counter("gozer_cache_hit_total", "Verdict cache hits.", atomic.LoadUint64(&m.cacheHit))
 	counter("gozer_cache_miss_total", "Verdict cache misses.", atomic.LoadUint64(&m.cacheMiss))
+	counter("gozer_cache_coalesced_total", "Requests sharing an in-flight same-key cache miss.", atomic.LoadUint64(&m.cacheCoalesced))
 
 	fmt.Fprint(w, "# HELP gozer_backend_error_total Backend errors by network.\n# TYPE gozer_backend_error_total counter\n")
 	fmt.Fprintf(w, "gozer_backend_error_total{backend=\"dcc\"} %d\n", atomic.LoadUint64(&m.backendErr.dcc))
 	fmt.Fprintf(w, "gozer_backend_error_total{backend=\"razor\"} %d\n", atomic.LoadUint64(&m.backendErr.razor))
 	fmt.Fprintf(w, "gozer_backend_error_total{backend=\"pyzor\"} %d\n", atomic.LoadUint64(&m.backendErr.pyzor))
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	fmt.Fprint(w, "# HELP gozer_latency_seconds Backend request latency.\n# TYPE gozer_latency_seconds histogram\n")
+	var cumulative uint64
 	for i, b := range m.buckets {
+		cumulative += atomic.LoadUint64(&m.bcounts[i])
 		fmt.Fprintf(w, "gozer_latency_seconds_bucket{le=\"%s\"} %d\n",
-			strconv.FormatFloat(b, 'g', -1, 64), m.bcounts[i])
+			strconv.FormatFloat(b, 'g', -1, 64), cumulative)
 	}
-	fmt.Fprintf(w, "gozer_latency_seconds_bucket{le=\"+Inf\"} %d\n", m.count)
-	fmt.Fprintf(w, "gozer_latency_seconds_sum %s\n", strconv.FormatFloat(m.sum, 'g', -1, 64))
-	fmt.Fprintf(w, "gozer_latency_seconds_count %d\n", m.count)
+	count := atomic.LoadUint64(&m.count)
+	sum := math.Float64frombits(atomic.LoadUint64(&m.sumBits))
+	fmt.Fprintf(w, "gozer_latency_seconds_bucket{le=\"+Inf\"} %d\n", count)
+	fmt.Fprintf(w, "gozer_latency_seconds_sum %s\n", strconv.FormatFloat(sum, 'g', -1, 64))
+	fmt.Fprintf(w, "gozer_latency_seconds_count %d\n", count)
 }
 
 // observeSince records a latency sample from a start time.
 func (m *Metrics) observeSince(t time.Time) { m.observe(time.Since(t).Seconds()) }
+
+func atomicAddFloat64(addr *uint64, delta float64) {
+	for {
+		old := atomic.LoadUint64(addr)
+		next := math.Float64bits(math.Float64frombits(old) + delta)
+		if atomic.CompareAndSwapUint64(addr, old, next) {
+			return
+		}
+	}
+}

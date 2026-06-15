@@ -29,9 +29,10 @@ func TestMemCacheExpiry(t *testing.T) {
 func TestMemCacheEviction(t *testing.T) {
 	c := newMemCache(2, time.Minute)
 	c.Put("a", []byte("1"))
-	time.Sleep(time.Millisecond) // distinct expiry timestamps
 	c.Put("b", []byte("2"))
-	time.Sleep(time.Millisecond)
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("expected a hit")
+	}
 	c.Put("c", []byte("3")) // forces eviction back under cap of 2
 
 	if len(c.d) > 2 {
@@ -40,8 +41,21 @@ func TestMemCacheEviction(t *testing.T) {
 	if _, ok := c.Get("c"); !ok {
 		t.Error("newest entry c should survive")
 	}
-	if _, ok := c.Get("a"); ok {
-		t.Error("oldest entry a should have been evicted")
+	if _, ok := c.Get("b"); ok {
+		t.Error("least-recently-used entry b should have been evicted")
+	}
+}
+
+func TestMemCacheRefreshAtCapacity(t *testing.T) {
+	c := newMemCache(2, time.Minute)
+	c.Put("a", []byte("1"))
+	c.Put("b", []byte("2"))
+	c.Put("b", []byte("updated"))
+	if _, ok := c.Get("a"); !ok {
+		t.Error("refreshing b must not evict a")
+	}
+	if got, ok := c.Get("b"); !ok || string(got) != "updated" {
+		t.Errorf("refreshed b = %q, %t", got, ok)
 	}
 }
 

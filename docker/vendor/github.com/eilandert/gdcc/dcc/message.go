@@ -8,6 +8,7 @@ import "bytes"
 // field, keeping raw bytes (str2ck strips the embedded line endings anyway).
 // The body is everything after the first empty line.
 func splitHeadersBody(msg []byte) (fields [][]byte, body []byte) {
+	fields = make([][]byte, 0, 4)
 	i := 0
 	for i < len(msg) {
 		nl := bytes.IndexByte(msg[i:], '\n')
@@ -24,11 +25,9 @@ func splitHeadersBody(msg []byte) (fields [][]byte, body []byte) {
 		}
 		if len(fields) > 0 && (line[0] == ' ' || line[0] == '\t') {
 			last := len(fields) - 1
-			fields[last] = append(fields[last], line...)
+			fields[last] = fields[last][:len(fields[last])+len(line)]
 		} else {
-			f := make([]byte, len(line))
-			copy(f, line)
-			fields = append(fields, f)
+			fields = append(fields, line)
 		}
 		i = end
 	}

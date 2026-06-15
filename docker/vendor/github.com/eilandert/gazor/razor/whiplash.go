@@ -23,7 +23,6 @@ var (
 	reCutWS    = regexp.MustCompile(`(?s)[\r\n\s].*$`)
 	rePort     = regexp.MustCompile(`:.*$`)
 	reIP       = regexp.MustCompile(`^[\d.]+$`)
-	reNextHTTP = regexp.MustCompile(`(?s)http://(.*)$`)
 	reAutolink = regexp.MustCompile(`(?i)\s+(www.[^ /><"` + "\r\n" + `]+)`)
 )
 
@@ -52,26 +51,38 @@ func Whiplash(text string) []string {
 }
 
 func extractHosts(text string) []string {
-	text = reHexEsc.ReplaceAllStringFunc(text, func(m string) string {
-		n, _ := strconv.ParseInt(m[1:], 16, 32)
-		return string(rune(n)) // #nosec G115 -- URI-escape value, 0..255
-	})
-	text = reDecEsc.ReplaceAllStringFunc(text, func(m string) string {
-		n, _ := strconv.Atoi(reDecEsc.FindStringSubmatch(m)[1])
-		return string(rune(n)) // #nosec G115 -- URI-escape value, 0..255
-	})
+	if strings.IndexByte(text, '%') >= 0 {
+		text = reHexEsc.ReplaceAllStringFunc(text, func(m string) string {
+			n, _ := strconv.ParseInt(m[1:], 16, 32)
+			return string(rune(n)) // #nosec G115 -- URI-escape value, 0..255
+		})
+	}
+	if strings.Contains(text, "&#") {
+		text = reDecEsc.ReplaceAllStringFunc(text, func(m string) string {
+			n, _ := strconv.Atoi(reDecEsc.FindStringSubmatch(m)[1])
+			return string(rune(n)) // #nosec G115 -- URI-escape value, 0..255
+		})
+	}
 
 	// Autolinks (\s+www.<...>, e.g. Outlook) are collected RAW and kept ahead of
 	// the http-extracted hosts — but only if an http/href URL is also present.
 	// With no such URL, razor's extract_hosts returns () and the autolinks are
 	// discarded along with everything else.
 	var hosts []string
-	for _, m := range reAutolink.FindAllStringSubmatch(text, -1) {
-		hosts = append(hosts, m[1])
+	if containsASCIIFold(text, "www.") {
+		for _, m := range reAutolink.FindAllStringSubmatch(text, -1) {
+			hosts = append(hosts, m[1])
+		}
 	}
 
-	if m := reHref.FindStringSubmatch(text); m != nil {
-		text = "a href = http://" + m[1]
+	if containsASCIIFold(text, "href") {
+		if m := reHref.FindStringSubmatch(text); m != nil {
+			text = "a href = http://" + m[1]
+		} else if m := reHTTP.FindStringSubmatch(text); m != nil {
+			text = "http://" + m[1]
+		} else {
+			return nil
+		}
 	} else if m := reHTTP.FindStringSubmatch(text); m != nil {
 		text = "http://" + m[1]
 	} else {
@@ -90,13 +101,39 @@ func extractHosts(text string) []string {
 		if !contains(hosts, canonical) && len(canonical) > 1 && strings.Contains(canonical, ".") {
 			hosts = append(hosts, canonical)
 		}
-		m := reNextHTTP.FindStringSubmatch(text)
-		if m == nil {
+		i := strings.Index(text, "http://")
+		if i < 0 {
 			break
 		}
-		text = m[1]
+		text = text[i+len("http://"):]
 	}
 	return hosts
+}
+
+func containsASCIIFold(s, substr string) bool {
+	if len(substr) == 0 {
+		return true
+	}
+	for i := 0; i+len(substr) <= len(s); i++ {
+		match := true
+		for j := range len(substr) {
+			a, b := s[i+j], substr[j]
+			if a >= 'A' && a <= 'Z' {
+				a += 'a' - 'A'
+			}
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if a != b {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // nextHost ports Razor2::Signature::Whiplash::next_host.

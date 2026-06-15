@@ -66,7 +66,10 @@ const dccProbe = "From: a@b.c\r\nMessage-ID: <x@y>\r\n\r\n" +
 func TestCheckDCCMany(t *testing.T) {
 	port, stop := fakeDCC(t, false, dccTgtsMany)
 	defer stop()
-	r := dccBackend(port).checkDCC([]byte(dccProbe))
+	r, healthy := dccBackend(port).checkDCC([]byte(dccProbe))
+	if !healthy {
+		t.Fatal("live DCC result marked unhealthy")
+	}
 	if r.Action != "reject" {
 		t.Errorf("many should reject, got %q", r.Action)
 	}
@@ -78,7 +81,10 @@ func TestCheckDCCMany(t *testing.T) {
 func TestCheckDCCAccept(t *testing.T) {
 	port, stop := fakeDCC(t, false, dccTgtsOK)
 	defer stop()
-	r := dccBackend(port).checkDCC([]byte(dccProbe))
+	r, healthy := dccBackend(port).checkDCC([]byte(dccProbe))
+	if !healthy {
+		t.Fatal("live DCC result marked unhealthy")
+	}
 	if r.Action != "accept" {
 		t.Errorf("whitelist should accept, got %q", r.Action)
 	}
@@ -90,7 +96,10 @@ func TestCheckDCCAccept(t *testing.T) {
 func TestCheckDCCUnknownLowCount(t *testing.T) {
 	port, stop := fakeDCC(t, false, 5)
 	defer stop()
-	r := dccBackend(port).checkDCC([]byte(dccProbe))
+	r, healthy := dccBackend(port).checkDCC([]byte(dccProbe))
+	if !healthy {
+		t.Fatal("live DCC result marked unhealthy")
+	}
 	if r.Action != "unknown" || r.Bulk != nil {
 		t.Errorf("low count should be unknown/nil, got %q/%v", r.Action, r.Bulk)
 	}
@@ -103,7 +112,10 @@ func TestCheckDCCError(t *testing.T) {
 		dcc:  &dcc.Client{Servers: []dcc.Server{{Host: "127.0.0.1", Port: 1}}, Timeout: 300 * time.Millisecond},
 		logf: func(string, ...any) {},
 	}
-	r := b.checkDCC([]byte(dccProbe))
+	r, healthy := b.checkDCC([]byte(dccProbe))
+	if healthy {
+		t.Fatal("failed DCC result marked healthy")
+	}
 	if r.Action != "unknown" || r.Bulk != nil {
 		t.Errorf("backend error should be unknown/nil, got %q/%v", r.Action, r.Bulk)
 	}

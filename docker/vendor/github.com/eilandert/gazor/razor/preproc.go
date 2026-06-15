@@ -251,16 +251,17 @@ func deHTMLDoit(text []byte) []byte {
 
 // --- deNewline ---
 
-var reTrailNL = regexp.MustCompile(`\n+$`)
-
 func deNewlineDoit(text []byte) []byte {
 	hdr, body, hasBlank := splitHdrBody(text)
 	if !hasBlank || len(body) == 0 {
 		return text
 	}
-	trimmed := reTrailNL.ReplaceAll(body, nil)
-	if len(trimmed) == len(body) {
+	end := len(body)
+	for end > 0 && body[end-1] == '\n' {
+		end--
+	}
+	if end == len(body) {
 		return text // no trailing newlines removed
 	}
-	return joinHdrBody(hdr, trimmed)
+	return joinHdrBody(hdr, body[:end])
 }

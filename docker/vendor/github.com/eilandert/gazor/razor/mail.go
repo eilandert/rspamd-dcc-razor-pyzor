@@ -24,7 +24,6 @@ var (
 	reFold      = regexp.MustCompile(`\n\s+`)
 	reBoundary  = regexp.MustCompile(`(?i)Content-Type: multipart.+boundary=("[^"]+"|\S+)`)
 	reContentTy = regexp.MustCompile(`(?i)^Content-Type:`)
-	reCRLF      = regexp.MustCompile(`\r+\n`)
 	reNonWS     = regexp.MustCompile(`\S`)
 	reLastLine  = regexp.MustCompile(`(?s)\n[^\n]*$`)
 )
@@ -170,8 +169,8 @@ func prepPart(mail []byte, maxhdr, maxbdy int) []byte {
 	if isBinary {
 		body = enBase64Doit(body)
 	}
-	body = reCRLF.ReplaceAll(body, []byte("\n"))
-	hdr = reCRLF.ReplaceAll(hdr, []byte("\n"))
+	body = normalizeCRLF(body)
+	hdr = normalizeCRLF(hdr)
 
 	if l := len(body); l > maxbdy {
 		body = body[:maxbdy]
@@ -208,7 +207,7 @@ func capWithOriglen(hdr []byte, field string, max int) []byte {
 // --- enBase64 ---
 
 func enBase64Isit(text []byte) bool {
-	if strings.HasPrefix(string(text), "Content-Type-Encoding: 8-bit") {
+	if bytes.HasPrefix(text, []byte("Content-Type-Encoding: 8-bit")) {
 		return true
 	}
 	// first byte in {0x00-0x1F, '|', 0x7F-0xFF}; binary unless it is \t \n \r

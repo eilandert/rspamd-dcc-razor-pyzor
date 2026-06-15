@@ -27,6 +27,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	for _, want := range []string{
 		"gozer_check_total 1",
 		"gozer_report_total 1",
+		"gozer_cache_coalesced_total 0",
 		"gozer_backend_error_total{backend=\"dcc\"}",
 		"gozer_latency_seconds_count 2",
 	} {

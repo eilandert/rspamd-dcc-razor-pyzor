@@ -3,7 +3,6 @@ package gozer
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,7 +18,7 @@ import (
 // implementation; tests inject a fake to exercise the HTTP layer without live
 // razor/pyzor network calls.
 type Engine interface {
-	Check(msg []byte) Verdict
+	Check(msg []byte) (Verdict, bool)
 	Report(msg []byte) ReportResult
 	Revoke(msg []byte) ReportResult
 	HasRazorIdentity() bool
@@ -31,6 +31,8 @@ type Server struct {
 	engine  Engine
 	cache   Cache
 	sem     chan struct{}
+	flights flightGroup
+	epochs  [256]atomic.Uint64
 	metrics *Metrics
 }
 
@@ -150,18 +152,16 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	// Acquire a concurrency slot BEFORE buffering the (up to MaxBody) body, so a
 	// burst of large uploads cannot hold unbounded goroutines/memory while never
 	// consuming a slot. Each request opens razor/pyzor/DCC sockets downstream.
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-time.After(s.cfg.BackendTimeout):
+	if !s.acquire() {
 		s.metrics.inc(&s.metrics.busyTotal)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
 		s.logf("%s 503 busy (max_concurrent=%d reached)", path, s.cfg.MaxConcurrent)
 		return
 	}
+	defer func() { <-s.sem }()
 
-	msg, err := io.ReadAll(io.LimitReader(r.Body, length))
-	if err != nil {
+	msg := make([]byte, int(length))
+	if _, err := io.ReadFull(r.Body, msg); err != nil {
 		s.metrics.inc(&s.metrics.errorTotal)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read error"})
 		return
@@ -173,54 +173,97 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	// invalidate any cached /check verdict for the same message.
 	var cacheKey string
 	if s.cache != nil {
-		cacheKey = sha256hex(msg)
+		cacheKey = sha256key(msg)
 	}
+	var body []byte
+	cacheStatus := ""
 	if path == "/check" && cacheKey != "" {
 		if hit, found := s.cache.Get(cacheKey); found {
 			s.metrics.inc(&s.metrics.cacheHit)
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-DRP-Cache", "hit")
-			w.Header().Set("Content-Length", strconv.Itoa(len(hit)))
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(hit)
-			s.vlogf("/check %dB cache=hit %.1fms -> %s", len(msg), msSince(t0), hit)
-			return
+			body = hit
+			cacheStatus = "hit"
+		} else {
+			result, shared := s.flights.Do(cacheKey, func() flightResult {
+				// A leader may have populated the cache between the first lookup
+				// and registering this flight.
+				if hit, found := s.cache.Get(cacheKey); found {
+					return flightResult{body: hit, fromCache: true}
+				}
+				s.metrics.inc(&s.metrics.cacheMiss)
+				epoch := s.epochs[cacheKey[0]].Load()
+				computed, cacheable := s.dispatch(path, msg)
+				if cacheable && s.epochs[cacheKey[0]].Load() == epoch {
+					s.cache.Put(cacheKey, computed)
+				}
+				return flightResult{body: computed}
+			})
+			body = result.body
+			if shared {
+				s.metrics.inc(&s.metrics.cacheCoalesced)
+				cacheStatus = "coalesced"
+			} else if result.fromCache {
+				s.metrics.inc(&s.metrics.cacheHit)
+				cacheStatus = "hit"
+			} else {
+				cacheStatus = "miss"
+			}
 		}
-		s.metrics.inc(&s.metrics.cacheMiss)
+	} else {
+		if cacheKey != "" {
+			s.epochs[cacheKey[0]].Add(1)
+		}
+		body, _ = s.dispatch(path, msg)
 	}
-
-	body := s.dispatch(path, msg)
-	switch {
-	case path == "/check" && cacheKey != "":
-		s.cache.Put(cacheKey, body)
-	case (path == "/report" || path == "/revoke") && cacheKey != "":
+	if (path == "/report" || path == "/revoke") && cacheKey != "" {
 		// the message's spam status just changed — drop the stale /check verdict
+		// and prevent an older in-flight check from repopulating it afterward.
+		s.epochs[cacheKey[0]].Add(1)
 		s.cache.Delete(cacheKey)
+	}
+	if cacheStatus == "hit" || cacheStatus == "coalesced" {
+		w.Header().Set("X-DRP-Cache", cacheStatus)
 	}
 	writeRaw(w, http.StatusOK, "application/json", body)
 
 	if path == "/check" {
-		s.vlogf("/check %dB cache=miss %.1fms -> %s", len(msg), msSince(t0), body) // high volume
+		s.vlogf("/check %dB cache=%s %.1fms -> %s", len(msg), cacheStatus, msSince(t0), body) // high volume
 	} else {
 		// /report + /revoke are rare feedback actions — always log (audit trail).
 		s.logf("%s %dB %.1fms -> %s", path, len(msg), msSince(t0), body)
 	}
 }
 
+func (s *Server) acquire() bool {
+	select {
+	case s.sem <- struct{}{}:
+		return true
+	default:
+	}
+	timer := time.NewTimer(s.cfg.BackendTimeout)
+	defer timer.Stop()
+	select {
+	case s.sem <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 // dispatch runs the backend for path and marshals the verdict. It never lets a
 // backend panic reach the caller: on panic it logs and returns safe defaults
 // (the rspamd plugin must never see a 500).
-func (s *Server) dispatch(path string, msg []byte) (body []byte) {
+func (s *Server) dispatch(path string, msg []byte) (body []byte, cacheable bool) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.logf("%s backend panic: %v", path, rec)
 			body = defaultJSON(path)
+			cacheable = false
 		}
 	}()
 	var v any
 	switch path {
 	case "/check":
-		v = s.engine.Check(msg)
+		v, cacheable = s.engine.Check(msg)
 	case "/report":
 		v = s.engine.Report(msg)
 	case "/revoke":
@@ -228,9 +271,9 @@ func (s *Server) dispatch(path string, msg []byte) (body []byte) {
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		return defaultJSON(path)
+		return defaultJSON(path), false
 	}
-	return b
+	return b, cacheable
 }
 
 func defaultJSON(path string) []byte {
@@ -279,9 +322,9 @@ func writeRaw(w http.ResponseWriter, code int, ctype string, body []byte) {
 	_, _ = w.Write(body) // #nosec G705 -- application/json (or text/plain) API response, not an HTML/XSS sink
 }
 
-func sha256hex(b []byte) string {
+func sha256key(b []byte) string {
 	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
+	return string(sum[:])
 }
 
 func msSince(t time.Time) float64 { return float64(time.Since(t).Microseconds()) / 1000 }

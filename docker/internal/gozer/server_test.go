@@ -2,10 +2,12 @@ package gozer
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,13 +16,37 @@ import (
 // fakeEngine returns canned verdicts and counts calls, so HTTP-layer tests
 // never touch the live razor/pyzor networks.
 type fakeEngine struct {
-	checks  atomic.Int32
-	reports atomic.Int32
-	panicOn string
+	checks    atomic.Int32
+	reports   atomic.Int32
+	panicOn   string
+	delay     time.Duration
+	unhealthy bool
 }
 
-func (f *fakeEngine) Check(msg []byte) Verdict {
+type overlapEngine struct {
+	fakeEngine
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *overlapEngine) Check(msg []byte) (Verdict, bool) {
+	if e.checks.Add(1) == 1 {
+		close(e.started)
+		<-e.release
+	}
+	n := 7
+	return Verdict{
+		DCC:   DCCResult{Action: "reject", Bulk: &n},
+		Razor: RazorResult{Hit: true},
+		Pyzor: PyzorResult{Count: 3},
+	}, true
+}
+
+func (f *fakeEngine) Check(msg []byte) (Verdict, bool) {
 	f.checks.Add(1)
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 	if f.panicOn == "/check" {
 		panic("boom")
 	}
@@ -29,7 +55,7 @@ func (f *fakeEngine) Check(msg []byte) Verdict {
 		DCC:   DCCResult{Action: "reject", Bulk: &n},
 		Razor: RazorResult{Hit: true},
 		Pyzor: PyzorResult{Count: 3, WL: 0},
-	}
+	}, !f.unhealthy
 }
 
 func (f *fakeEngine) Report(msg []byte) ReportResult {
@@ -178,6 +204,93 @@ func TestCheckCache(t *testing.T) {
 
 	if got := eng.checks.Load(); got != 1 {
 		t.Errorf("engine should run once (cached), ran %d times", got)
+	}
+}
+
+func TestCheckCacheCoalescesConcurrentMisses(t *testing.T) {
+	eng := &fakeEngine{delay: 50 * time.Millisecond}
+	cache := newMemCache(8, time.Minute)
+	srv := testServer(t, "tok", eng, cache)
+
+	const requests = 12
+	start := make(chan struct{})
+	errs := make(chan error, requests)
+	var wg sync.WaitGroup
+	wg.Add(requests)
+	for range requests {
+		go func() {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/check", strings.NewReader("same-body"))
+			if err != nil {
+				errs <- err
+				return
+			}
+			req.Header.Set("Authorization", "Bearer tok")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				errs <- fmt.Errorf("status %d", resp.StatusCode)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if got := eng.checks.Load(); got != 1 {
+		t.Errorf("engine should run once for concurrent same-key misses, ran %d times", got)
+	}
+}
+
+func TestCheckDoesNotCacheDegradedVerdict(t *testing.T) {
+	eng := &fakeEngine{unhealthy: true}
+	cache := newMemCache(8, time.Minute)
+	srv := testServer(t, "tok", eng, cache)
+
+	for range 2 {
+		resp := post(t, srv.URL, "/check", "tok", "same-body")
+		resp.Body.Close()
+	}
+	if got := eng.checks.Load(); got != 2 {
+		t.Errorf("degraded verdict must be retried, engine ran %d times", got)
+	}
+}
+
+func TestFeedbackOverlappingCheckDoesNotRepopulateCache(t *testing.T) {
+	eng := &overlapEngine{started: make(chan struct{}), release: make(chan struct{})}
+	cache := newMemCache(8, time.Minute)
+	srv := testServer(t, "tok", eng, cache)
+
+	done := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/check", strings.NewReader("same-body"))
+		req.Header.Set("Authorization", "Bearer tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	<-eng.started
+
+	report := post(t, srv.URL, "/report", "tok", "same-body")
+	report.Body.Close()
+	close(eng.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	resp := post(t, srv.URL, "/check", "tok", "same-body")
+	resp.Body.Close()
+	if got := eng.checks.Load(); got != 2 {
+		t.Errorf("overlapping pre-feedback verdict was cached; checks=%d", got)
 	}
 }
 

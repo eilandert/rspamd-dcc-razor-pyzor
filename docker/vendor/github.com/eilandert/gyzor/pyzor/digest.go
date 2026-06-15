@@ -10,6 +10,7 @@
 package pyzor
 
 import (
+	"bytes"
 	"crypto/sha1" // #nosec G505 -- pyzor wire protocol mandates SHA1; not a security primitive here
 	"encoding/base64"
 	"encoding/hex"
@@ -47,21 +48,19 @@ var digestSpec = [][2]int{{20, 3}, {60, 3}}
 const wsClass = `\t\n\x0b\f\r \x{1c}-\x{1f}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}`
 
 var (
-	longstrPtrn = regexp.MustCompile(`[^` + wsClass + `]{10,}`)
-	emailPtrn   = regexp.MustCompile(`[^` + wsClass + `]+@[^` + wsClass + `]+`)
-	urlPtrn     = regexp.MustCompile(`(?i)[a-z]+:[^` + wsClass + `]+`)
-	wsPtrn      = regexp.MustCompile(`[` + wsClass + `]`)
+	emailPtrn = regexp.MustCompile(`[^` + wsClass + `]+@[^` + wsClass + `]+`)
+	urlPtrn   = regexp.MustCompile(`(?i)[a-z]+:[^` + wsClass + `]+`)
 )
 
 // Compute returns the lowercase SHA1 hex digest of msg, where msg is the raw
 // RFC-822 message bytes.
 func Compute(msg []byte) string {
-	var lines [][]byte
+	var lines []string
 	for _, payload := range digestPayloads(msg) {
 		for _, line := range splitLines(payload) {
 			norm := normalize(line)
 			if shouldHandleLine(norm) {
-				lines = append(lines, []byte(norm))
+				lines = append(lines, norm)
 			}
 		}
 	}
@@ -69,7 +68,7 @@ func Compute(msg []byte) string {
 	h := sha1.New() // #nosec G401 -- pyzor protocol mandates SHA1 for the message digest
 	if len(lines) <= atomicNumLines {
 		for _, ln := range lines {
-			h.Write(rstrip(ln))
+			_, _ = io.WriteString(h, rstrip(ln))
 		}
 	} else {
 		for _, spec := range digestSpec {
@@ -78,7 +77,7 @@ func Compute(msg []byte) string {
 			for i := 0; i < length; i++ {
 				idx := start + i
 				if idx >= 0 && idx < len(lines) {
-					h.Write(rstrip(lines[idx]))
+					_, _ = io.WriteString(h, rstrip(lines[idx]))
 				}
 			}
 		}
@@ -89,12 +88,51 @@ func Compute(msg []byte) string {
 // normalize mirrors DataDigester.normalize: strip NULs, blank out long tokens /
 // emails / URLs, remove ALL whitespace, then trim.
 func normalize(s string) string {
-	s = strings.ReplaceAll(s, "\x00", "")
-	s = longstrPtrn.ReplaceAllString(s, "")
-	s = emailPtrn.ReplaceAllString(s, "")
-	s = urlPtrn.ReplaceAllString(s, "")
-	s = wsPtrn.ReplaceAllString(s, "")
-	return strings.TrimFunc(s, isPySpace)
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	s = removeLongRuns(s)
+	if strings.IndexByte(s, '@') >= 0 {
+		s = emailPtrn.ReplaceAllString(s, "")
+	}
+	if strings.IndexByte(s, ':') >= 0 {
+		s = urlPtrn.ReplaceAllString(s, "")
+	}
+	return removePyWhitespace(s)
+}
+
+func removeLongRuns(s string) string {
+	runStart, runes, last := 0, 0, 0
+	var out strings.Builder
+	for i, r := range s {
+		if !isPySpace(r) {
+			if runes == 0 {
+				runStart = i
+			}
+			runes++
+			continue
+		}
+		if runes >= 10 {
+			if out.Cap() == 0 {
+				out.Grow(len(s))
+			}
+			out.WriteString(s[last:runStart])
+			last = i
+		}
+		runes = 0
+	}
+	if runes >= 10 {
+		if out.Cap() == 0 {
+			out.Grow(len(s))
+		}
+		out.WriteString(s[last:runStart])
+		last = len(s)
+	}
+	if out.Cap() == 0 {
+		return s
+	}
+	out.WriteString(s[last:])
+	return out.String()
 }
 
 // isPySpace matches Python str.strip()'s whitespace set (== wsClass above). After
@@ -120,35 +158,63 @@ func shouldHandleLine(s string) bool {
 	return utf8.RuneCountInString(s) >= minLineLength
 }
 
+func removePyWhitespace(s string) string {
+	first := -1
+	for i, r := range s {
+		if isPySpace(r) {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	out.WriteString(s[:first])
+	last := first
+	for i, r := range s[first:] {
+		if !isPySpace(r) {
+			continue
+		}
+		i += first
+		out.WriteString(s[last:i])
+		last = i + utf8.RuneLen(r)
+	}
+	out.WriteString(s[last:])
+	return out.String()
+}
+
 // rstrip removes trailing ASCII whitespace, matching Python bytes.rstrip().
-func rstrip(b []byte) []byte {
-	return []byte(strings.TrimRight(string(b), " \t\n\r\x0b\x0c"))
+func rstrip(s string) string {
+	return strings.TrimRight(s, " \t\n\r\x0b\x0c")
 }
 
 // splitLines mirrors Python str.splitlines() for the line boundaries that occur
 // in mail: \r\n, \r, \n, \v, \f, \x1c-\x1e, \x85, U+2028, U+2029.
 func splitLines(s string) []string {
 	var out []string
-	var b strings.Builder
-	runes := []rune(s)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
+	start := 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
 		switch r {
 		case '\n', '\v', '\f', '\x1c', '\x1d', '\x1e', '\u0085', '\u2028', '\u2029':
-			out = append(out, b.String())
-			b.Reset()
+			out = append(out, s[start:i])
+			i += size
+			start = i
 		case '\r':
-			out = append(out, b.String())
-			b.Reset()
-			if i+1 < len(runes) && runes[i+1] == '\n' {
-				i++ // consume the \n of a \r\n pair
+			out = append(out, s[start:i])
+			i += size
+			if i < len(s) && s[i] == '\n' {
+				i++
 			}
+			start = i
 		default:
-			b.WriteRune(r)
+			i += size
 		}
 	}
-	if b.Len() > 0 {
-		out = append(out, b.String())
+	if start < len(s) {
+		out = append(out, s[start:])
 	}
 	return out
 }
@@ -158,13 +224,13 @@ func splitLines(s string) []string {
 //   - non-text leaf -> raw (undecoded) payload, as pyzor's get_payload() returns
 //   - multipart container -> skipped (children are walked)
 func digestPayloads(raw []byte) []string {
-	m, err := mail.ReadMessage(strings.NewReader(string(raw)))
+	m, err := mail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
 		// Unparseable as a message: treat the whole thing as one text payload,
 		// mirroring how pyzor still digests a degenerate message body.
 		return []string{string(raw)}
 	}
-	body := readAll(m.Body)
+	body := readAllHint(m.Body, len(raw))
 	return walkPart(m.Header.Get("Content-Type"), m.Header.Get("Content-Transfer-Encoding"), body)
 }
 
@@ -186,7 +252,7 @@ func walkPart(ctypeHeader, cte string, body []byte) []string {
 			return []string{string(body)}
 		}
 		var out []string
-		mr := multipart.NewReader(strings.NewReader(string(body)), boundary)
+		mr := multipart.NewReader(bytes.NewReader(body), boundary)
 		for {
 			p, err := mr.NextRawPart() // raw: do not CTE-decode here
 			if err != nil {
@@ -225,6 +291,18 @@ func readAll(r io.Reader) []byte {
 	return b
 }
 
+func readAllHint(r io.Reader, hint int) []byte {
+	if hint <= 0 {
+		return readAll(r)
+	}
+	b := make([]byte, hint)
+	n, err := io.ReadFull(r, b)
+	if err != nil {
+		return b[:n]
+	}
+	return append(b, readAll(r)...)
+}
+
 func splitMediaType(mt string) (main, sub string) {
 	if i := strings.IndexByte(mt, '/'); i >= 0 {
 		return mt[:i], mt[i+1:]
@@ -241,13 +319,15 @@ func decodeCTE(body []byte, cte string) []byte {
 		// base64.b64decode with validate=False (which DISCARDS non-alphabet
 		// bytes, including whitespace), and on a decode error (bad length/
 		// padding) registers a defect and returns the RAW, undecoded payload.
-		dec, err := base64.StdEncoding.DecodeString(filterBase64(string(body)))
+		filtered := filterBase64(body)
+		dec := make([]byte, base64.StdEncoding.DecodedLen(len(filtered)))
+		n, err := base64.StdEncoding.Decode(dec, filtered)
 		if err != nil {
 			return body // decode failed -> Python yields the raw payload
 		}
-		return dec
+		return dec[:n]
 	case "quoted-printable":
-		dec := readAll(quotedprintable.NewReader(strings.NewReader(string(body))))
+		dec := readAll(quotedprintable.NewReader(bytes.NewReader(body)))
 		return dec
 	default:
 		return body
@@ -257,18 +337,35 @@ func decodeCTE(body []byte, cte string) []byte {
 // filterBase64 drops every byte that is not in the standard base64 alphabet
 // (incl. '=' padding), matching base64.b64decode(validate=False) which discards
 // non-alphabet characters before decoding.
-func filterBase64(s string) string {
-	var sb strings.Builder
-	sb.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
-			c == '+', c == '/', c == '=':
-			sb.WriteByte(c)
+func filterBase64(src []byte) []byte {
+	firstInvalid := -1
+	for i, c := range src {
+		if !isBase64Byte(c) {
+			firstInvalid = i
+			break
 		}
 	}
-	return sb.String()
+	if firstInvalid < 0 {
+		return src
+	}
+	out := make([]byte, 0, len(src))
+	out = append(out, src[:firstInvalid]...)
+	for _, c := range src[firstInvalid:] {
+		if isBase64Byte(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func isBase64Byte(c byte) bool {
+	switch {
+	case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+		c == '+', c == '/', c == '=':
+		return true
+	default:
+		return false
+	}
 }
 
 // decodeCharset decodes bytes to a string, matching pyzor's
@@ -301,8 +398,19 @@ func decodeCharset(b []byte, cs string) string {
 
 // asciiIgnore is Python bytes.decode("ascii", "ignore"): drop every byte >= 0x80.
 func asciiIgnore(b []byte) string {
+	first := -1
+	for i, c := range b {
+		if c >= 0x80 {
+			first = i
+			break
+		}
+	}
+	if first < 0 {
+		return string(b)
+	}
 	out := make([]byte, 0, len(b))
-	for _, c := range b {
+	out = append(out, b[:first]...)
+	for _, c := range b[first:] {
 		if c < 0x80 {
 			out = append(out, c)
 		}
@@ -313,7 +421,11 @@ func asciiIgnore(b []byte) string {
 // utf8Ignore is Python bytes.decode("utf-8", "ignore"): keep valid runes, drop
 // invalid bytes one at a time.
 func utf8Ignore(b []byte) string {
+	if utf8.Valid(b) {
+		return string(b)
+	}
 	var sb strings.Builder
+	sb.Grow(len(b))
 	for i := 0; i < len(b); {
 		r, size := utf8.DecodeRune(b[i:])
 		if r == utf8.RuneError && size == 1 {
@@ -329,7 +441,7 @@ func utf8Ignore(b []byte) string {
 // normalizeHTMLPart mirrors DataDigester.normalize_html_part: collect text
 // nodes (skipping <script>/<style>), join with single spaces.
 func normalizeHTMLPart(s string) string {
-	var data []string
+	var out strings.Builder
 	z := html.NewTokenizer(strings.NewReader(s))
 	collect := true
 	for {
@@ -350,12 +462,15 @@ func normalizeHTMLPart(s string) string {
 			}
 		case html.TextToken:
 			if collect {
-				t := strings.TrimSpace(string(z.Text()))
-				if t != "" {
-					data = append(data, t)
+				t := bytes.TrimSpace(z.Text())
+				if len(t) != 0 {
+					if out.Len() != 0 {
+						out.WriteByte(' ')
+					}
+					_, _ = out.Write(t)
 				}
 			}
 		}
 	}
-	return strings.Join(data, " ")
+	return out.String()
 }

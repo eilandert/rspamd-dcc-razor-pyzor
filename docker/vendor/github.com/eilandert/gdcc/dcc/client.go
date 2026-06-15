@@ -1,6 +1,7 @@
 package dcc
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -56,6 +57,45 @@ type Client struct {
 	hid  uint32    // op_nums.h, randomised once
 	pid  uint32    // op_nums.p
 	rid  uint32    // op_nums.r, atomic
+
+	addrMu    sync.Mutex           // guards addrCache
+	addrCache map[Server]addrEntry // resolved UDP addr cache (short TTL)
+}
+
+// addrTTL bounds how long a resolved UDP address is reused before re-resolving,
+// so the default-pool's four hostnames are not re-resolved on every message
+// while still picking up DNS changes / failovers within a short window.
+const addrTTL = 30 * time.Second
+
+type addrEntry struct {
+	addr *net.UDPAddr
+	exp  time.Time
+}
+
+// resolve returns a (cached) UDP address for srv. A cached entry is reused until
+// addrTTL elapses; resolution failures are not cached. The cache is safe for the
+// shared Client used in gozer serve mode.
+func (c *Client) resolve(srv Server) (*net.UDPAddr, error) {
+	now := time.Now()
+	c.addrMu.Lock()
+	if e, ok := c.addrCache[srv]; ok && now.Before(e.exp) {
+		c.addrMu.Unlock()
+		return e.addr, nil
+	}
+	c.addrMu.Unlock()
+
+	key := net.JoinHostPort(srv.Host, fmt.Sprint(srv.port()))
+	addr, err := net.ResolveUDPAddr("udp", key)
+	if err != nil {
+		return nil, err
+	}
+	c.addrMu.Lock()
+	if c.addrCache == nil {
+		c.addrCache = make(map[Server]addrEntry)
+	}
+	c.addrCache[srv] = addrEntry{addr: addr, exp: now.Add(addrTTL)}
+	c.addrMu.Unlock()
+	return addr, nil
 }
 
 func (c *Client) logf(format string, args ...interface{}) {
@@ -122,8 +162,14 @@ func (c *Client) ensureIDs() {
 // Check queries the DCC servers for the message's checksums and returns the
 // per-checksum counts. It does not increment any counts.
 func (c *Client) Check(msg []byte) (Result, error) {
+	return c.CheckContext(context.Background(), msg)
+}
+
+// CheckContext is Check bounded by ctx: a cancelled/expired ctx stops the DNS,
+// retransmit and UDP-wait work promptly instead of running to the full Timeout.
+func (c *Client) CheckContext(ctx context.Context, msg []byte) (Result, error) {
 	cks := Checksums(msg)
-	return c.send(opQuery, 0, cks)
+	return c.send(ctx, opQuery, 0, cks)
 }
 
 // Report submits the message's checksums to the DCC servers, incrementing the
@@ -132,19 +178,29 @@ func (c *Client) Report(msg []byte) error {
 	return c.ReportN(msg, 1)
 }
 
+// ReportContext is Report bounded by ctx.
+func (c *Client) ReportContext(ctx context.Context, msg []byte) error {
+	return c.ReportNContext(ctx, msg, 1)
+}
+
 // ReportN reports the message as received by n recipients.
 func (c *Client) ReportN(msg []byte, n uint32) error {
+	return c.ReportNContext(context.Background(), msg, n)
+}
+
+// ReportNContext is ReportN bounded by ctx.
+func (c *Client) ReportNContext(ctx context.Context, msg []byte, n uint32) error {
 	if n == 0 {
 		n = 1
 	}
 	cks := Checksums(msg)
-	_, err := c.send(opReport, n, cks)
+	_, err := c.send(ctx, opReport, n, cks)
 	return err
 }
 
 // send builds the query/report, transmits it to each server in turn with
 // retransmission, and decodes the first valid answer.
-func (c *Client) send(op int, tgts uint32, cks []Checksum) (Result, error) {
+func (c *Client) send(ctx context.Context, op int, tgts uint32, cks []Checksum) (Result, error) {
 	n := reportableCount(cks)
 	if n == 0 {
 		return Result{}, fmt.Errorf("dcc: no reportable checksums (body too short?)")
@@ -159,23 +215,41 @@ func (c *Client) send(op int, tgts uint32, cks []Checksum) (Result, error) {
 
 	servers := c.servers()
 
+	// One TOTAL operation deadline: Timeout (or ctx's earlier deadline) bounds
+	// the whole call, not each server attempt — so sequential report failover
+	// across N silent servers can no longer take N*Timeout.
+	deadline := time.Now().Add(c.timeout())
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+
 	// Reports must reach a single server: the inter-server flooding algorithm
 	// dedups by (sender,h,p,r), and racing a report to several servers would be
 	// counted as separate copies. So reports go sequentially, advancing only
 	// when a server gives no answer at all. Queries are safe to race for
 	// resilience against a slow/dead first server.
 	if op == opQuery && len(servers) > 1 {
-		return c.parallelQuery(servers, op, sender, nums, tgts, cks, passwd, n)
+		return c.parallelQuery(ctx, deadline, servers, op, sender, nums, tgts, cks, passwd, n)
 	}
 
 	var lastErr error
-	for _, srv := range servers {
-		counts, err := c.exchange(nil, srv, op, sender, nums, tgts, cks, passwd, n)
+	for i, srv := range servers {
+		// Split the remaining budget across the servers still to try, so the
+		// first dead server cannot consume the whole deadline.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		attemptDeadline := time.Now().Add(remaining / time.Duration(len(servers)-i))
+		counts, err := c.exchange(ctx, nil, srv, op, sender, nums, tgts, cks, passwd, n, attemptDeadline)
 		if err == nil {
 			return c.buildResult(cks, counts), nil
 		}
 		c.vlogf("server %s: %v", srv.Host, err)
 		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("dcc: no servers configured")
@@ -186,7 +260,7 @@ func (c *Client) send(op int, tgts uint32, cks []Checksum) (Result, error) {
 
 // parallelQuery races a query across all servers and returns the first valid
 // answer, signalling the losing goroutines to stop.
-func (c *Client) parallelQuery(servers []Server, op int, sender uint32, nums opNums, tgts uint32, cks []Checksum, passwd []byte, n uint32) (Result, error) {
+func (c *Client) parallelQuery(ctx context.Context, deadline time.Time, servers []Server, op int, sender uint32, nums opNums, tgts uint32, cks []Checksum, passwd []byte, n uint32) (Result, error) {
 	type res struct {
 		counts []answerCount
 		err    error
@@ -195,7 +269,7 @@ func (c *Client) parallelQuery(servers []Server, op int, sender uint32, nums opN
 	out := make(chan res, len(servers))
 	for _, srv := range servers {
 		go func(srv Server) {
-			counts, err := c.exchange(stop, srv, op, sender, nums, tgts, cks, passwd, n)
+			counts, err := c.exchange(ctx, stop, srv, op, sender, nums, tgts, cks, passwd, n, deadline)
 			out <- res{counts, err}
 		}(srv)
 	}
@@ -218,8 +292,8 @@ func (c *Client) parallelQuery(servers []Server, op int, sender uint32, nums opN
 
 // exchange handles one server: resolve, send, retransmit with exponential
 // backoff up to maxXmits, and wait for a matching answer within the budget.
-func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint32, nums opNums, tgts uint32, cks []Checksum, passwd []byte, n uint32) ([]answerCount, error) {
-	raddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(srv.Host, fmt.Sprint(srv.port())))
+func (c *Client) exchange(ctx context.Context, stop <-chan struct{}, srv Server, op int, sender uint32, nums opNums, tgts uint32, cks []Checksum, passwd []byte, n uint32, deadline time.Time) ([]answerCount, error) {
+	raddr, err := c.resolve(srv)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", srv.Host, err)
 	}
@@ -230,9 +304,9 @@ func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint3
 	defer conn.Close()
 
 	pkt := buildQuery(op, sender, nums, tgts, cks, passwd)
-	budget := c.timeout()
-	deadline := time.Now().Add(budget)
-	backoff := budget / (1 << maxXmits) // first wait; doubles each retransmit
+	// Retransmit cadence keys off Timeout; the hard stop is the passed deadline
+	// (the shared total-operation budget), not a fresh per-attempt timeout.
+	backoff := c.timeout() / (1 << maxXmits)
 	if backoff < 50*time.Millisecond {
 		backoff = 50 * time.Millisecond
 	}
@@ -241,6 +315,8 @@ func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint3
 		select {
 		case <-stop:
 			return nil, errStopped
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		default:
 		}
 
@@ -257,7 +333,7 @@ func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint3
 		if waitUntil.After(deadline) {
 			waitUntil = deadline
 		}
-		counts, err := c.readAnswer(stop, conn, n, nums, passwd, waitUntil)
+		counts, err := c.readAnswer(ctx, stop, conn, n, nums, passwd, waitUntil)
 		if err == nil {
 			return counts, nil
 		}
@@ -269,17 +345,21 @@ func (c *Client) exchange(stop <-chan struct{}, srv Server, op int, sender uint3
 		}
 		backoff *= 2
 	}
-	return nil, fmt.Errorf("no answer from %s after %v", srv.Host, budget)
+	return nil, fmt.Errorf("no answer from %s before deadline", srv.Host)
 }
 
 // readAnswer reads datagrams until a matching answer arrives or the deadline
 // passes. Stray/late datagrams (wrong transaction id) are skipped.
-func (c *Client) readAnswer(stop <-chan struct{}, conn *net.UDPConn, n uint32, nums opNums, passwd []byte, until time.Time) ([]answerCount, error) {
-	buf := make([]byte, 2048)
+func (c *Client) readAnswer(ctx context.Context, stop <-chan struct{}, conn *net.UDPConn, n uint32, nums opNums, passwd []byte, until time.Time) ([]answerCount, error) {
+	bufp := answerBufPool.Get().(*[2048]byte)
+	defer answerBufPool.Put(bufp)
+	buf := bufp[:]
 	for {
 		select {
 		case <-stop:
 			return nil, errStopped
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		default:
 		}
 		if !time.Now().Before(until) {
@@ -310,6 +390,10 @@ func (c *Client) readAnswer(stop <-chan struct{}, conn *net.UDPConn, n uint32, n
 		}
 		return counts, nil
 	}
+}
+
+var answerBufPool = sync.Pool{
+	New: func() any { return new([2048]byte) },
 }
 
 // buildResult pairs the answer counts with the reportable checksums, in order.
