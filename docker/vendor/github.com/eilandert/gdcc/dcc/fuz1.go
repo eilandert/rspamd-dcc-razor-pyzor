@@ -88,19 +88,11 @@ type fuz1State struct {
 	eol   int // most recent eol, -1 = none
 	total int
 	md5   hash.Hash
-	url   ckURL
-
-	// fuz2WordCount mirrors cks->fuz2.lang[0].wtotal; only affects domsBuf
-	// management (fed to Fuz2/DNSBL), never the Fuz1 sum. Default 0.
-	fuz2WordCount int
+	c     *cks // back-pointer for the shared URL extractor + Fuz2 word count
 }
 
 func newFuz1State() *fuz1State {
-	f := &fuz1State{md5: md5.New(), eol: -1} // #nosec G401 -- DCC Fuz1 checksum is MD5 by protocol
-	f.url.st = urlIdle
-	f.url.cref.st = crefIdle
-	f.url.start, f.url.tld, f.url.sld = -1, -1, -1
-	return f
+	return &fuz1State{md5: md5.New(), eol: -1} // #nosec G401 -- DCC Fuz1 checksum is MD5 by protocol
 }
 
 func (f *fuz1State) addSum(length int) {
@@ -131,7 +123,7 @@ func (u *ckURL) resetDomsBuf(urlStart int) {
 }
 
 func (f *fuz1State) urlHostSave(uc byte) {
-	u := &f.url
+	u := &f.c.url
 	if u.domEnd-u.domStart >= urlHostMax {
 		u.resetDomsBuf(-1)
 		u.flags |= urlTooLong
@@ -147,7 +139,7 @@ func (f *fuz1State) urlHostSave(uc byte) {
 // urlHostEnd ports url_host_end: finalises a captured host name, removes the
 // third-level label from the Fuz1 buffer, and (for Fuz2) trims domsBuf.
 func (f *fuz1State) urlHostEnd() {
-	u := &f.url
+	u := &f.c.url
 	if u.punct != 0 {
 		u.domEnd = u.punct
 	}
@@ -173,7 +165,7 @@ func (f *fuz1State) urlHostEnd() {
 			}
 			f.cp = u.start + length
 		}
-		if f.fuz2WordCount < fuz2MinWords {
+		if f.c.fz2WordCount() < fuz2MinWords {
 			length := u.domEnd - u.dot2
 			copy(u.domsBuf[u.domStart:u.domStart+length], u.domsBuf[u.dot2:u.dot2+length])
 			u.domEnd = u.domStart + length
@@ -187,7 +179,7 @@ func (f *fuz1State) urlHostEnd() {
 // ckURLStep ports ck_url. pos points at the input index just past uc; cref
 // completion may rewind it. Returns the disposition of uc.
 func (f *fuz1State) ckURLStep(uc byte, pos *int) urlRes {
-	u := &f.url
+	u := &f.c.url
 
 	if uc == '&' || u.cref.st != crefIdle {
 		i := u.cref.step(uc)
@@ -274,7 +266,7 @@ func (f *fuz1State) ckURLStep(uc byte, pos *int) urlRes {
 
 	case urlSlash2:
 		if uc == '/' {
-			if f.fuz2WordCount >= fuz2MinWords {
+			if f.c.fz2WordCount() >= fuz2MinWords {
 				u.domStart = 0
 			} else {
 				for u.domStart > domsBufSize-urlHostMaxSave {
@@ -425,7 +417,7 @@ func (f *fuz1State) fuz1(bp []byte) {
 		c := toLower(bp[pos])
 		pos++
 
-		if c == 'h' || c == '=' || f.url.st != urlIdle {
+		if c == 'h' || c == '=' || f.c.url.st != urlIdle {
 			f.cp = cp
 			res := f.ckURLStep(c, &pos)
 			cp = f.cp
@@ -461,7 +453,7 @@ func (f *fuz1State) fuz1(bp []byte) {
 			cp = 0
 			f.eol = -1
 			clearBuf(f.buf[:])
-			f.url.st = urlIdle
+			f.c.url.st = urlIdle
 			continue
 		}
 
@@ -469,7 +461,7 @@ func (f *fuz1State) fuz1(bp []byte) {
 			if f.eol != -1 {
 				if length := cp - f.eol; length > 0 && length <= fuz1MaxLine && dearSucker(f.buf[f.eol:cp]) {
 					cp = f.eol
-					f.url.st = urlIdle
+					f.c.url.st = urlIdle
 					continue
 				}
 			}
@@ -478,7 +470,7 @@ func (f *fuz1State) fuz1(bp []byte) {
 				cp = 0
 				f.eol = -1
 				clearBuf(f.buf[:])
-				f.url.st = urlIdle
+				f.c.url.st = urlIdle
 				continue
 			}
 			f.eol = cp

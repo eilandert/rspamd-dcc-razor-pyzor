@@ -8,8 +8,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/eilandert/gazor v0.0.0-20260615002655-08ba389204b2 h1:kgnUzEpAMFQpqrgLZADvdwBi0l6L5k0T5O7m+RMBu/w=
 github.com/eilandert/gazor v0.0.0-20260615002655-08ba389204b2/go.mod h1:8hwEdLdotDNBWfC+HxKDntTLJS1JBEX9nL0yODJKBBU=
-github.com/eilandert/gdcc v0.0.0-20260615025938-06cffb50c851 h1:G6a/e3bm6iM3DTaOYuLPLSwHdN5bbzvNz6rwmE02JGE=
-github.com/eilandert/gdcc v0.0.0-20260615025938-06cffb50c851/go.mod h1:QySsxRcPV8EsFwFS0gZ7dKZx1NnIxQGqa2ZUAsv4Iws=
+github.com/eilandert/gdcc v0.0.0-20260615124344-2316265e010b h1:IRlcVRZF+PlRZMjC4a2aMpVvvKxCByEo69bwpgMsd+I=
+github.com/eilandert/gdcc v0.0.0-20260615124344-2316265e010b/go.mod h1:QySsxRcPV8EsFwFS0gZ7dKZx1NnIxQGqa2ZUAsv4Iws=
 github.com/eilandert/gyzor v0.0.0-20260615002656-ca468f5d7c9b h1:wifkpjDw70QzKVxDCL8tOgP3FT/JFYK6Uv6aXxQ7H8Y=
 github.com/eilandert/gyzor v0.0.0-20260615002656-ca468f5d7c9b/go.mod h1:qM7G/98YX28JqZKOBPhvk1TbX/J+cAfuG5+H7pU4XqY=
 github.com/klauspost/cpuid/v2 v2.2.10 h1:tBs3QSyvjDyFTq3uoc/9xFpCuOsJQFNPiAhYdw2skhE=

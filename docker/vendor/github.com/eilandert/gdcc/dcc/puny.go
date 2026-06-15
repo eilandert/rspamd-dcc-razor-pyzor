@@ -34,7 +34,7 @@ func punyAdapt(delta, numpoints uint, firsttime bool) int {
 }
 
 func (f *fuz1State) punyencode() {
-	u := &f.url
+	u := &f.c.url
 	u.flags &^= urlIDN
 
 	var puny [urlLabelMax]byte

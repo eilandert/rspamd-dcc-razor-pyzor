@@ -4,7 +4,7 @@ go 1.24
 
 require (
 	github.com/eilandert/gazor v0.0.0-20260615002655-08ba389204b2
-	github.com/eilandert/gdcc v0.0.0-20260615025938-06cffb50c851
+	github.com/eilandert/gdcc v0.0.0-20260615124344-2316265e010b
 	github.com/eilandert/gyzor v0.0.0-20260615002656-ca468f5d7c9b
 	github.com/redis/go-redis/v9 v9.20.1
 )

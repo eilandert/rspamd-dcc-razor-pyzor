@@ -60,12 +60,11 @@ type fuz2State struct {
 	tag     ckWord
 	lang    [fuz2LangNum]fuz2Lang
 
-	mimeCset *[256]byte
-	mimeCt   int
+	c *cks // back-pointer for the shared mime charset/content-type + URL
 }
 
 func newFuz2State() *fuz2State {
-	f := &fuz2State{st: fuz2StWord, mimeCset: &cset8859_1, mimeCt: ckCtText}
+	f := &fuz2State{st: fuz2StWord}
 	f.cref.st = crefIdle
 	for i := range f.lang {
 		f.lang[i].md5 = md5.New() // #nosec G401 -- DCC Fuz2 checksum is MD5 by protocol
@@ -79,7 +78,7 @@ func (f *fuz2State) junk()     { f.wlen = skipWlen; f.st = fuz2StWord }
 func (f *fuz2State) addWord() {
 	for tbl := 0; tbl < fuz2LangNum; tbl++ {
 		t := &fuz2Tbls[tbl]
-		if t.cset != nil && t.cset != f.mimeCset {
+		if t.cset != nil && t.cset != f.c.mimeCset {
 			continue
 		}
 		if lookupWord(&f.w, f.wlen, t.words) {
@@ -99,7 +98,7 @@ func (f *fuz2State) fuz2(bp []byte) {
 			for pos < len(bp) {
 				c := bp[pos]
 				pos++
-				if f.cref.st != crefIdle || (c == '&' && f.mimeCt == ckCtHTML) {
+				if f.cref.st != crefIdle || (c == '&' && f.c.mimeCt == ckCtHTML) {
 					i := f.cref.step(c)
 					if i < 0 {
 						continue
@@ -107,7 +106,7 @@ func (f *fuz2State) fuz2(bp []byte) {
 					pos -= i
 					c = f.cref.result
 				}
-				c = f.mimeCset[c]
+				c = f.c.mimeCset[c]
 				if c >= fcA {
 					f.btotal++
 					if f.wlen < ckWordLen {
@@ -147,10 +146,10 @@ func (f *fuz2State) fuz2(bp []byte) {
 				pos++
 				break
 			}
-			if f.tagLen == 4 && f.mimeCt != ckCtHTML && string(f.tag[:4]) == "html" {
-				f.mimeCt = ckCtHTML
+			if f.tagLen == 4 && f.c.mimeCt != ckCtHTML && string(f.tag[:4]) == "html" {
+				f.c.mimeCt = ckCtHTML
 			}
-			if f.mimeCt == ckCtHTML && f.tagLen > 0 {
+			if f.c.mimeCt == ckCtHTML && f.tagLen > 0 {
 				f.xsummed += f.tagLen + 1
 				if c == '>' {
 					f.xsummed++
@@ -187,7 +186,7 @@ func (f *fuz2State) fuz2(bp []byte) {
 					f.st = fuz2StWord
 					break
 				}
-				if f.mimeCset[c] != fcSP {
+				if f.c.mimeCset[c] != fcSP {
 					f.xsummed++
 					f.btotal++
 					f.tagLen++
@@ -208,7 +207,7 @@ func (f *fuz2State) fuz2(bp []byte) {
 					f.st = fuz2StWord
 					break
 				}
-				if f.mimeCset[c] != fcSP {
+				if f.c.mimeCset[c] != fcSP {
 					f.xsummed++
 					f.btotal++
 					f.tagLen++

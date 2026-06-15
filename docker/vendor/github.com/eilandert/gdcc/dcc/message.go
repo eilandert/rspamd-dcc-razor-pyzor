@@ -49,6 +49,42 @@ func isBlankLine(line []byte) bool {
 	return false
 }
 
+// parseReturnPath ports ck.c:parse_return_path — the env-from value of a
+// Return-Path header (leading blanks skipped, trailing CR/LF stripped).
+func parseReturnPath(f []byte) (string, bool) {
+	if !hasPrefixFold(f, "Return-Path:") {
+		return "", false
+	}
+	v := f[len("Return-Path:"):]
+	for len(v) > 0 && (v[0] == ' ' || v[0] == '\t') {
+		v = v[1:]
+	}
+	for len(v) > 0 && (v[len(v)-1] == '\r' || v[len(v)-1] == '\n') {
+		v = v[:len(v)-1]
+	}
+	if len(v) == 0 {
+		return "", false
+	}
+	return string(v), true
+}
+
+// parseUnixFrom ports ck.c:parse_unix_from — the address of a UNIX mbox
+// "From sender date" separator line (the first body byte of an mbox message).
+func parseUnixFrom(f []byte) (string, bool) {
+	if len(f) < len("From ") || string(f[:len("From ")]) != "From " {
+		return "", false
+	}
+	v := f[len("From "):]
+	for len(v) > 0 && v[0] == ' ' {
+		v = v[1:]
+	}
+	sp := bytes.IndexByte(v, ' ')
+	if sp <= 0 {
+		return "", false
+	}
+	return string(v[:sp]), true
+}
+
 // hasPrefixFold reports a case-insensitive prefix match (CLITCMP).
 func hasPrefixFold(b []byte, prefix string) bool {
 	if len(b) < len(prefix) {
@@ -68,8 +104,14 @@ func hasPrefixFold(b []byte, prefix string) bool {
 func Checksums(msg []byte) []Checksum {
 	fields, body := splitHeadersBody(msg)
 
-	var fromSum, msgIDSum *Sum
-	for _, f := range fields {
+	c := newCks()
+	var fromSum, msgIDSum, recvSum *Sum
+	var envFrom string
+	var envFromSet bool
+	for i, f := range fields {
+		// Notice Content-Type / Content-Transfer-Encoding (sets up the body
+		// transfer-encoding, charset and any multipart boundary).
+		c.ckMimeHdr(f)
 		switch {
 		case hasPrefixFold(f, "From:"):
 			s := str2ck("", string(f[len("From:"):]))
@@ -77,6 +119,24 @@ func Checksums(msg []byte) []Checksum {
 		case hasPrefixFold(f, "Message-ID:"):
 			s := str2ck("", string(f[len("Message-ID:"):]))
 			msgIDSum = &s
+		case hasPrefixFold(f, "Received:"):
+			// the last Received header wins
+			s := str2ck("", string(f[len("Received:"):]))
+			recvSum = &s
+		}
+		// Envelope sender: a UNIX "From " line (only as the first line) or the
+		// first Return-Path header; first wins (matches dccproc).
+		if !envFromSet {
+			if i == 0 {
+				if v, ok := parseUnixFrom(f); ok {
+					envFrom, envFromSet = v, true
+				}
+			}
+			if !envFromSet {
+				if v, ok := parseReturnPath(f); ok {
+					envFrom, envFromSet = v, true
+				}
+			}
 		}
 	}
 	// dccproc synthesises a checksum of "" when there is no Message-ID.
@@ -86,18 +146,26 @@ func Checksums(msg []byte) []Checksum {
 		msgIDSum = &s
 	}
 
-	// Body + fuzzy checksums.
-	bodySum, bodyOK, fuz1Sum, fuz1OK, fuz2Sum, fuz2OK := computeBody(body)
+	// Body + fuzzy checksums (with MIME multipart / transfer-encoding / charset).
+	bodySum, bodyOK, fuz1Sum, fuz1OK, fuz2Sum, fuz2OK := c.computeBody(body)
 
 	var out []Checksum
 	add := func(t CkType, s Sum, report bool) {
 		out = append(out, Checksum{Type: t, Label: t.label(), Sum: s, Report: report})
+	}
+	// dccproc -C prints checksums in type order: env_From(2), From(3),
+	// Message-ID(5), Received(6), Body(7), Fuz1(8), Fuz2(9).
+	if envFromSet {
+		add(CkEnvFrom, str2ck("", envFrom), true)
 	}
 	if fromSum != nil {
 		add(CkFrom, *fromSum, true)
 	}
 	// A real Message-ID is reported; a synthesised empty one is not (rpt2srvr=0).
 	add(CkMessageID, *msgIDSum, msgIDPresent)
+	if recvSum != nil {
+		add(CkReceived, *recvSum, true)
+	}
 	if bodyOK {
 		add(CkBody, bodySum, true)
 	}
