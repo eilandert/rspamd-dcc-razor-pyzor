@@ -30,7 +30,7 @@ networks at once, with **no per-message subprocess forks at all**.
   └─────────────────────┘                          └──────────────────────────────┘
 ```
 
-The image is a single ~19 MB static `gozer` binary on a `distroless/static`
+The image is a single ~6 MB static `gozer` binary on a `distroless/static`
 base — no Debian, no s6 supervisor, no shell, no per-message fork. `gozer` is
 the container entrypoint and runs as `nonroot`. Its source lives in its own
 repo, [eilandert/gozer](https://github.com/eilandert/gozer), pulled in here as
@@ -361,7 +361,7 @@ the reference perl/python/C clients (each is gated by parity tests against real
 razor, pyzor and `dccproc` in its own CI), so the servers see identical
 fingerprints and the switch is invisible on the wire. With **no per-message fork
 left**, the image dropped from ~268 MB (perl/python/dcc + s6 on Debian) to a
-**~19 MB distroless static binary**.
+**~6 MB distroless static binary**.
 
 Upgrading from an older build: the backend's environment variables were renamed
 `SHIM_*` to `GOZER_*` (for example `SHIM_TOKEN` becomes `GOZER_TOKEN`). The HTTP
