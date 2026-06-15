@@ -2,12 +2,31 @@
 # Standalone DCC/Razor/Pyzor backend for rspamd, supervised by s6-overlay.
 # This image runs NO rspamd. It exposes one authenticated HTTP endpoint (:8077)
 # that rspamd's dcc_razor_pyzor.lua plugin (in a SEPARATE container) queries.
-#   * spamcheck_shim — HTTP wrapper around the three CLIs (s6 longrun, runs as
-#     the unprivileged `drp` user). dccproc is set-UID dcc; razor/pyzor run as drp.
-#   * razor / pyzor / dccproc — per-message CLIs invoked by the shim.
+#   * gozer — a single static Go binary that speaks Razor (gazor) and Pyzor
+#     (gyzor) IN-PROCESS and runs DCC via the dccproc CLI. It replaces the old
+#     Python implementation that forked the perl razor-* and python pyzor CLIs per
+#     message; the only per-message fork left is dccproc (set-UID dcc). gozer
+#     itself runs as the unprivileged `drp` user.
 #
-# dcc / razor / pyzor come from our own Debian packages on deb.myguard.nl (the
-# apt repo + signing key are already configured in eilandert/debian-base).
+# dcc comes from our own Debian package on deb.myguard.nl (the apt repo + signing
+# key are already configured in eilandert/debian-base). razor/pyzor/perl/python
+# are NO LONGER installed — gazor and gyzor are linked into the Go binary.
+ARG GO_VERSION=1.24
+
+# --- build stage: compile the static gozer binary (fully offline: deps are
+# vendored, so no module proxy / git fetch is needed) ---------------------------
+FROM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY vendor/ ./vendor/
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+ARG GOZER_VERSION=dev
+RUN CGO_ENABLED=0 go build -mod=vendor -trimpath \
+      -ldflags="-s -w -X main.version=${GOZER_VERSION}" \
+      -o /out/gozer ./cmd/gozer
+
+# --- runtime stage --------------------------------------------------------------
 FROM eilandert/debian-base:stable
 LABEL org.opencontainers.image.authors="eilandert"
 LABEL org.opencontainers.image.source="https://github.com/eilandert/rspamd-dcc-razor-pyzor"
@@ -25,15 +44,9 @@ ARG S6_OVERLAY_VERSION=3.2.1.0
 RUN set -ex; \
     apt-get -y update; \
     apt-get --no-install-recommends -y install ca-certificates curl xz-utils; \
-    # The three collaborative-filter backends, from deb.myguard.nl.
-    apt-get --no-install-recommends -y install \
-      dcc \
-      razor \
-      pyzor \
-      python3 \
-      python3-redis \
-      perl \
-      libio-socket-ip-perl; \
+    # DCC is the only backend still run out-of-process (no Go DCC client).
+    # Razor and Pyzor are linked into gozer, so no razor/pyzor/perl/python.
+    apt-get --no-install-recommends -y install dcc; \
     # s6-overlay (verify sha256 against the upstream checksum files).
     cd /tmp; \
     for f in s6-overlay-noarch.tar.xz s6-overlay-x86_64.tar.xz; do \
@@ -44,7 +57,7 @@ RUN set -ex; \
       tar -C / -Jxpf "${f}"; \
       rm -f "${f}" "${f}.sha256"; \
     done; \
-    # Unprivileged user the shim runs as (forks razor/pyzor on hostile input).
+    # Unprivileged user gozer runs as (parses hostile message bytes).
     adduser --system --group --no-create-home --home /var/lib/drp drp; \
     mkdir -p "${RAZORHOME}" "${PYZOR_HOME}" /run/dcc; \
     chown -R drp:drp "${RAZORHOME}" "${PYZOR_HOME}"; \
@@ -54,33 +67,24 @@ RUN set -ex; \
     apt-get -y purge xz-utils; \
     apt-get -y autoremove; \
     apt-get -y clean autoclean; \
-    # Slim: drop docs/man/locale/info + perl pod + python bytecode caches. The
-    # interpreters (perl for razor, python for pyzor + the shim) are mandatory and
-    # can't be removed; this strips the dead weight that ships alongside them.
+    # Slim: drop docs/man/locale/info. No perl/python interpreters to keep now.
     rm -rf /var/lib/apt/lists/* /var/cache/apt \
            /usr/share/man /usr/local/share/man /usr/share/doc /usr/share/info \
-           /usr/share/locale/* /usr/share/perl*/*/pod; \
-    find /usr -depth -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+           /usr/share/locale/*
 
-# Project payload (shim + razor daemon + s6 service tree). The rspamd plugin
-# lives in the repo (../rspamd) for installing into a SEPARATE rspamd — the
-# backend image runs no rspamd and does not bake the plugin.
-COPY shim/   /opt/drp/shim/
-COPY razord/ /opt/drp/razord/
-COPY root/   /
+# The static Go backend + the s6 service tree.
+COPY --from=build --chmod=0755 /out/gozer /usr/local/bin/gozer
+COPY root/ /
 COPY --chmod=0755 healthcheck.sh /healthcheck.sh
 
 RUN set -ex; \
-    chmod 0755 /opt/drp/shim/spamcheck_shim.py \
-               /opt/drp/razord/razorfy.pl \
-               /etc/s6-overlay/scripts/init-bootstrap.sh \
-               /etc/s6-overlay/s6-rc.d/shim/run \
-               /etc/s6-overlay/s6-rc.d/razord/run
+    chmod 0755 /etc/s6-overlay/scripts/init-bootstrap.sh \
+               /etc/s6-overlay/s6-rc.d/gozer/run
 
 # Persist identities/state so they survive container recreation.
 VOLUME [ "/var/lib/razor", "/var/lib/pyzor", "/var/dcc" ]
 
-# spamcheck shim HTTP endpoint queried by the external rspamd plugin. Reachable
+# gozer HTTP endpoint queried by the external rspamd plugin. Reachable
 # on the docker network only — do NOT publish to the host (see docker-compose).
 EXPOSE 8077
 

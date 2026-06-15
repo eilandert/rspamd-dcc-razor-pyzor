@@ -1,7 +1,7 @@
 name: docker-integration
-# Manual: builds the real image and smoke-tests the HTTP API. Needs the
-# eilandert/debian-base image + the deb.myguard.nl apt repo (for dcc/razor/pyzor),
-# so it is not run on every push.
+# Manual: builds the real image (Go builder stage + dcc from deb.myguard.nl) and
+# smoke-tests the HTTP API. Needs the eilandert/debian-base image + the
+# deb.myguard.nl apt repo (for dcc), so it is not run on every push.
 on:
   workflow_dispatch:
 

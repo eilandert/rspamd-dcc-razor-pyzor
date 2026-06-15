@@ -1,6 +1,6 @@
 #!/bin/sh
 # s6 oneshot: one-time setup for the standalone DRP backend. Must exit 0 before
-# the shim longrun starts. Backend setup failures are non-fatal — a missing
+# the gozer longrun starts. Backend setup failures are non-fatal — a missing
 # network just degrades that filter; only a broken container would block.
 #
 # Identities (Razor account, DCC client-id, Pyzor account) can be supplied via
@@ -9,7 +9,7 @@
 # volume > anonymous auto-registration. Every credential var also honours a
 # "<VAR>_FILE" form (Docker/compose secrets): the value is read from that path.
 #
-# The shim runs as the unprivileged `drp` user, so the Razor/Pyzor homes are
+# gozer runs as the unprivileged `drp` user, so the Razor/Pyzor homes are
 # chowned to drp here. DCC's dccproc is set-UID dcc and uses /var/dcc directly.
 set -eu
 
@@ -71,71 +71,69 @@ if command -v cdcc >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Razor (RAZORHOME, owned by drp). Identity: RAZOR_IDENTITY (raw identity-file
-# content) takes priority, else RAZOR_REGISTER_USER (+ RAZOR_REGISTER_PASS)
-# registers/links that account, else an anonymous identity is auto-registered.
+# Razor (RAZORHOME, owned by drp). The Go backend speaks razor in-process and
+# discovers catalogue/nomination servers itself, so no razor-admin -create/
+# -discover is needed — only the nomination credential for /report and /revoke.
+# Precedence: RAZOR_USER+RAZOR_PASS (an existing account) > a credential already
+# persisted in the volume > a fresh registration (RAZOR_REGISTER_USER registers
+# a named account, otherwise anonymous). The credential is written to
+# RAZORHOME/gazor-identity, which gozer loads at start. Registration touches
+# the network and is best-effort: on failure /check still works, only report/
+# revoke wait until a credential exists.
 # ---------------------------------------------------------------------------
 export RAZORHOME=/var/lib/razor
-if command -v razor-admin >/dev/null 2>&1; then
-    mkdir -p "$RAZORHOME"
-    [ -f "$RAZORHOME/razor-agent.conf" ] || \
-        razor-admin -home="$RAZORHOME" -create >/dev/null 2>&1 || true
-    [ -f "$RAZORHOME/servers.catalogue.lst" ] || \
-        razor-admin -home="$RAZORHOME" -discover >/dev/null 2>&1 || true
+mkdir -p "$RAZORHOME"
+IDFILE="$RAZORHOME/gazor-identity"
 
-    RAZOR_IDENTITY="$(resolve RAZOR_IDENTITY)"
-    RAZOR_REGISTER_USER="$(resolve RAZOR_REGISTER_USER)"
-    RAZOR_REGISTER_PASS="$(resolve RAZOR_REGISTER_PASS)"
+RAZOR_USER="$(resolve RAZOR_USER)"
+RAZOR_PASS="$(resolve RAZOR_PASS)"
+RAZOR_REGISTER_USER="$(resolve RAZOR_REGISTER_USER)"
+RAZOR_REGISTER_PASS="$(resolve RAZOR_REGISTER_PASS)"
 
-    if [ -n "${RAZOR_IDENTITY}" ]; then
-        echo "[DRP] Razor: installing provided identity"
-        printf '%s\n' "${RAZOR_IDENTITY}" > "$RAZORHOME/identity"
-        chmod 0600 "$RAZORHOME/identity"
-    elif [ ! -f "$RAZORHOME/identity" ]; then
-        if [ -n "${RAZOR_REGISTER_USER}" ]; then
-            echo "[DRP] Razor: registering account ${RAZOR_REGISTER_USER}"
-            razor-admin -home="$RAZORHOME" -register \
-                -user="${RAZOR_REGISTER_USER}" -pass="${RAZOR_REGISTER_PASS}" \
-                >/dev/null 2>&1 || true
-        else
-            echo "[DRP] Razor: registering anonymous identity"
-            razor-admin -home="$RAZORHOME" -register >/dev/null 2>&1 || true
-        fi
+if [ -n "${RAZOR_USER}" ] && [ -n "${RAZOR_PASS}" ]; then
+    echo "[DRP] Razor: using provided RAZOR_USER credential"
+    printf 'user=%s\npass=%s\n' "${RAZOR_USER}" "${RAZOR_PASS}" > "$IDFILE"
+elif [ ! -f "$IDFILE" ]; then
+    if [ -n "${RAZOR_REGISTER_USER}" ]; then
+        echo "[DRP] Razor: registering account ${RAZOR_REGISTER_USER}"
+        gozer razor-register --user "${RAZOR_REGISTER_USER}" \
+            --pass "${RAZOR_REGISTER_PASS}" --out "$IDFILE" >/dev/null 2>&1 \
+            || echo "[DRP] Razor: registration failed (report/revoke disabled until it succeeds)" >&2
+    else
+        echo "[DRP] Razor: registering anonymous identity"
+        gozer razor-register --out "$IDFILE" >/dev/null 2>&1 \
+            || echo "[DRP] Razor: registration failed (report/revoke disabled until it succeeds)" >&2
     fi
-    chown -R drp:drp "$RAZORHOME" 2>/dev/null || true
 fi
+{ [ -f "$IDFILE" ] && chmod 0600 "$IDFILE"; } 2>/dev/null || true
+chown -R drp:drp "$RAZORHOME" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Pyzor (PYZOR_HOME, owned by drp). Anonymous against the public server by
-# default. PYZOR_SERVERS overrides the server list; PYZOR_ACCOUNT supplies an
-# accounts file for authenticated reporting.
+# Pyzor (PYZOR_HOME, owned by drp). The Go backend reads PYZOR_HOME/servers and
+# falls back to the public server (public.pyzor.org), so no `pyzor discover` is
+# needed. Optional: PYZOR_SERVERS overrides the server list; PYZOR_ACCOUNT
+# supplies an accounts file for authenticated reporting.
 # ---------------------------------------------------------------------------
 export PYZOR_HOME=/var/lib/pyzor
-if command -v pyzor >/dev/null 2>&1; then
-    mkdir -p "$PYZOR_HOME"
+mkdir -p "$PYZOR_HOME"
 
-    PYZOR_SERVERS="$(resolve PYZOR_SERVERS)"
-    PYZOR_ACCOUNT="$(resolve PYZOR_ACCOUNT)"
+PYZOR_SERVERS="$(resolve PYZOR_SERVERS)"
+PYZOR_ACCOUNT="$(resolve PYZOR_ACCOUNT)"
 
-    if [ -n "${PYZOR_SERVERS}" ]; then
-        echo "[DRP] Pyzor: installing provided server list"
-        printf '%s\n' "${PYZOR_SERVERS}" > "$PYZOR_HOME/servers"
-    elif [ ! -f "$PYZOR_HOME/servers" ]; then
-        echo "[DRP] Pyzor: discovering servers"
-        pyzor --homedir "$PYZOR_HOME" discover >/dev/null 2>&1 || true
-    fi
+if [ -n "${PYZOR_SERVERS}" ]; then
+    echo "[DRP] Pyzor: installing provided server list"
+    printf '%s\n' "${PYZOR_SERVERS}" > "$PYZOR_HOME/servers"
+fi
+if [ -n "${PYZOR_ACCOUNT}" ]; then
+    echo "[DRP] Pyzor: installing provided accounts file"
+    printf '%s\n' "${PYZOR_ACCOUNT}" > "$PYZOR_HOME/accounts"
+    chmod 0600 "$PYZOR_HOME/accounts"
+fi
+chown -R drp:drp "$PYZOR_HOME" 2>/dev/null || true
 
-    if [ -n "${PYZOR_ACCOUNT}" ]; then
-        echo "[DRP] Pyzor: installing provided accounts file"
-        printf '%s\n' "${PYZOR_ACCOUNT}" > "$PYZOR_HOME/accounts"
-        chmod 0600 "$PYZOR_HOME/accounts"
-    fi
-    chown -R drp:drp "$PYZOR_HOME" 2>/dev/null || true
+if [ -z "${GOZER_TOKEN:-}" ] && [ -z "${GOZER_TOKEN_FILE:-}" ]; then
+    echo "[DRP] WARNING: no GOZER_TOKEN/_FILE set — gozer will refuse all POSTs (503)." >&2
 fi
 
-if [ -z "${SHIM_TOKEN:-}" ] && [ -z "${SHIM_TOKEN_FILE:-}" ]; then
-    echo "[DRP] WARNING: no SHIM_TOKEN/_FILE set — the shim will refuse all POSTs (503)." >&2
-fi
-
-echo "[DRP] init-bootstrap complete; handing off to the shim."
+echo "[DRP] init-bootstrap complete; handing off to gozer."
 exit 0

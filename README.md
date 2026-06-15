@@ -11,45 +11,50 @@ at this backend.
 
 **Why a separate backend?** rspamd has a built-in DCC module but nothing for
 Razor or Pyzor, and shelling out to those CLIs from inside the rspamd worker
-would block its event loop. This service runs the CLIs out-of-process and
-answers over HTTP, so the plugin stays fully asynchronous and a single request
-covers all three networks at once.
+would block its event loop. This service is a single static Go binary that
+speaks **Razor and Pyzor in-process** (the [gazor](https://github.com/eilandert/gazor)
+and [gyzor](https://github.com/eilandert/gyzor) libraries) and runs **DCC** via
+`dccproc`, answering over HTTP — so the plugin stays fully asynchronous and a
+single request covers all three networks at once, with no per-message perl/python
+process forks.
 
 ## How it works
 
 ```
   ┌──────────────────────┐   HTTP :8077 + token   ┌────────────────────────────┐
   │  rspamd (your image)  │ ─────────────────────► │  rspamd-dcc-razor-pyzor     │
-  │  dcc_razor_pyzor.lua  │  POST /check (message) │  spamcheck_shim (s6, drp)   │
+  │  dcc_razor_pyzor.lua  │  POST /check (message) │  gozer  (s6, drp)           │
   └──────────────────────┘ ◄───────────────────── │   ├─ dccproc (set-UID dcc)  │
-                              JSON verdict         │   ├─ razor-check            │
-                                                   │   └─ pyzor check            │
+                              JSON verdict         │   ├─ gazor  (Razor, in-proc)│
+                                                   │   └─ gyzor  (Pyzor, in-proc)│
                                                    └────────────────────────────┘
 ```
 
 Inside the image (supervised by s6-overlay):
 
-- **`shim`** — `spamcheck_shim.py`, an HTTP server on `:8077` running as the
-  unprivileged `drp` user. It queries the three CLIs **concurrently** and caches
-  verdicts (see [Configuration](#configuration)).
+- **`gozer`** — the static Go HTTP server on `:8077` running as the
+  unprivileged `drp` user. It queries the three networks **concurrently**
+  (Razor/Pyzor in-process, DCC via `dccproc`) and caches verdicts (see
+  [Configuration](#configuration)).
 - **`init-bootstrap`** — one-shot setup of the DCC map, Razor identity and Pyzor
   server list.
 
 `dccproc` talks to the DCC servers directly (no `dccifd` daemon needed). Every
 backend is **best-effort**: if one network is unreachable it simply doesn't
 score, and the container stays healthy — the healthcheck only depends on the
-shim's `/health`.
+gozer's `/health`.
 
-**Hardening:** the shim runs non-root with bounded concurrency, every POST is
+**Hardening:** gozer runs non-root with bounded concurrency, every POST is
 **token-authenticated**, and the bundled compose runs the container read-only
 with `cap_drop: ALL`, `no-new-privileges`, and no published host port.
 
 ### Privacy: the message never touches disk
 
-The shim keeps the message in memory and feeds it to `dccproc` / `razor-check` /
-`pyzor` over **stdin** — nothing is written to a temp file. The cache stores only
-`sha256(body) → verdict` (never the body itself), and the same goes for the
-optional Redis backend, so no message content is ever persisted locally.
+Gozer keeps the message in memory: Razor and Pyzor are computed in-process,
+and DCC is fed to `dccproc` over **stdin** — nothing is written to a temp file.
+The cache stores only `sha256(body) → verdict` (never the body itself), and the
+same goes for the optional Redis backend, so no message content is ever persisted
+locally.
 
 (This is also why a `tmpfs` overlay would do nothing for speed: there is no
 per-message disk write to accelerate. The latency is **network** round-trips to
@@ -64,7 +69,7 @@ never uploaded.
 
 ### 1. Run the backend
 
-The shim rejects every POST until a token is configured, and it isn't published
+Gozer rejects every POST until a token is configured, and it isn't published
 to the host — so run it with compose:
 
 ```bash
@@ -92,7 +97,7 @@ Then set the backend URL and the **same token** in `local.d/dcc_razor_pyzor.conf
 
 ```
 url   = "http://rspamd-drp:8077/check";   # backend host:port
-token = "the-shared-secret";              # must equal the shim's SHIM_TOKEN
+token = "the-shared-secret";              # must equal gozer's GOZER_TOKEN
 ```
 
 > **Heads-up on DNS:** rspamd resolves URLs through its own configured resolver.
@@ -115,7 +120,7 @@ volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
 
 | Network | Identity | Anonymous default |
 |---------|----------|-------------------|
-| Razor | account registered via `razor-admin` | yes (random identity) |
+| Razor | nomination credential auto-registered by `gozer` | yes (random identity) |
 | DCC | client-id in `/var/dcc/ids` | yes (anonymous id) |
 | Pyzor | optional accounts file | yes (anonymous to the public server) |
 
@@ -127,13 +132,18 @@ the environment (see [`docker/docker-compose.yml`](docker/docker-compose.yml)):
 environment:
   DCC_CLIENT_ID: "1234567"
   DCC_CLIENT_PASSWD: "…"          # or DCC_IDS: <whole /var/dcc/ids file>
-  RAZOR_REGISTER_USER: "you@example.com"
-  RAZOR_REGISTER_PASS: "…"        # or RAZOR_IDENTITY: <identity file content>
+  RAZOR_REGISTER_USER: "you@example.com"   # register/link this account
+  RAZOR_REGISTER_PASS: "…"
+  # or, for an account you already hold, skip registration and supply it directly:
+  RAZOR_USER: "you@example.com"
+  RAZOR_PASS: "…"
   PYZOR_SERVERS: "public.pyzor.org:24441"
 ```
 
-Resolution order per network: **explicit env → existing file in the volume →
-anonymous**. Every credential variable also accepts a `<VAR>_FILE` form for
+Resolution order per network: **explicit env → existing credential in the volume
+→ anonymous**. For Razor that means `RAZOR_USER`+`RAZOR_PASS` win, else the
+persisted `gazor-identity` file, else a fresh registration. Every credential
+variable also accepts a `<VAR>_FILE` form for
 Docker secrets — e.g. `RAZOR_REGISTER_PASS_FILE=/run/secrets/razor_pass` — so a
 secret never has to sit in the compose file.
 
@@ -143,22 +153,22 @@ All settings are environment variables on the backend container:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SHIM_TOKEN` / `SHIM_TOKEN_FILE` | — | Shared secret for POST auth. **Required** — without it every POST returns 503. |
-| `SHIM_CACHE_TTL` | `300` | Verdict cache lifetime in seconds (`0` disables). Bulk mail repeats, so cache hits are the main speed-up. |
-| `SHIM_CACHE_SIZE` | `4096` | In-memory cache entries (LRU). |
-| `SHIM_REDIS_URL` | — | Use Redis for the cache so **multiple scanners share** it, e.g. `redis://valkey:6379/5`. Otherwise the cache is in-process. |
-| `SHIM_REDIS_PREFIX` | `drp:check:` | Key prefix in Redis. |
-| `SHIM_MAX_CONCURRENT` | `8` | Max in-flight requests (bounds CLI fork-out). |
-| `SHIM_BACKEND_TIMEOUT` | `6` | Per-CLI timeout in seconds. |
-| `SHIM_VERBOSE` | `0` (off) | Per-request logging — access line plus verdict, timing and cache hit/miss. Off by default (only startup and errors are logged). |
-| `SHIM_RAZORD_ADDR` | — (off) | Optional persistent Razor daemon (razorfy) at `host:port`. **Off by default** — benchmarks showed it ~4× slower than the `razor-check` CLI, so the CLI is used unless you set this. |
+| `GOZER_TOKEN` / `GOZER_TOKEN_FILE` | — | Shared secret for POST auth. **Required** — without it every POST returns 503. |
+| `GOZER_CACHE_TTL` | `300` | Verdict cache lifetime in seconds (`0` disables). Bulk mail repeats, so cache hits are the main speed-up. |
+| `GOZER_CACHE_SIZE` | `4096` | In-memory cache entries (LRU). |
+| `GOZER_REDIS_URL` | — | Use Redis for the cache so **multiple scanners share** it, e.g. `redis://valkey:6379/5`. Otherwise the cache is in-process. |
+| `GOZER_REDIS_PREFIX` | `drp:check:` | Key prefix in Redis. |
+| `GOZER_MAX_CONCURRENT` | `8` | Max in-flight requests (bounds backend fan-out). |
+| `GOZER_BACKEND_TIMEOUT` | `6` | Per-backend timeout in seconds. |
+| `GOZER_VERBOSE` | `0` (off) | Per-request logging — access line plus verdict, timing and cache hit/miss. Off by default (only startup and errors are logged). |
+| `RAZOR_MIN_CF` | `ac` | Razor minimum confidence: `ac`, `ac+N`, `ac-N`, or a number. |
 | `TZ` | — | Container timezone. |
 
 ## HTTP API
 
 The request body is always the raw RFC-822 message. POST endpoints require the
 token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
-(`401` if it's wrong, `503` if the shim has no token). `/health` needs no auth.
+(`401` if it's wrong, `503` if gozer has no token). `/health` needs no auth.
 
 - **`POST /check`** — query only, never reports. Used by the rspamd plugin.
 
@@ -184,7 +194,7 @@ token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
 `/check` is for scanning. `/report` and `/revoke` are for **user feedback** —
 when someone moves a message into Junk (spam) or rescues it back out (ham).
 Sieve can't speak HTTP, so [`dovecot/drp-report`](dovecot/drp-report) bridges the
-message to the shim, triggered by imapsieve.
+message to gozer, triggered by imapsieve.
 
 The [`eilandert/dovecot`](https://github.com/eilandert/dockerized) image already
 bakes this in. To wire it into **any other** Dovecot host (needs `curl` and
@@ -207,7 +217,7 @@ doveadm reload
 
 What it does ([`90-drp-sieve.conf`](dovecot/90-drp-sieve.conf)):
 
-| User action (IMAP) | Sieve script | Shim call |
+| User action (IMAP) | Sieve script | Gozer call |
 |--------------------|--------------|-----------|
 | move/copy **into** `Junk` | `report-spam.sieve` | `POST /report` (spam) |
 | move **out of** `Junk` | `report-ham.sieve` | `POST /revoke` (ham) |
@@ -235,6 +245,8 @@ is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 - Docker Hub: <https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor>
 - Monorepo: <https://github.com/eilandert/dockerized>
 - Article: <https://deb.myguard.nl/2026/06/rspamd-dcc-razor-pyzor-docker-backend/>
+- gazor (Razor client, imported in-process): <https://github.com/eilandert/gazor>
+- gyzor (Pyzor client, imported in-process): <https://github.com/eilandert/gyzor>
 
 ## License
 

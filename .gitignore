@@ -1,6 +1,6 @@
-*.pyc
-__pycache__/
 *.log
 *.tmp
+# built Go binary (compiled into the image; vendor/ IS committed for offline builds)
+/docker/gozer
 # local secrets (compose `secrets:` source) — never commit
 secrets/
