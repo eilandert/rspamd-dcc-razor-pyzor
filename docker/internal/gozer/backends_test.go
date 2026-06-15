@@ -1,81 +1,119 @@
 package gozer
 
 import (
-	"os"
-	"path/filepath"
+	"encoding/binary"
+	"net"
 	"testing"
 	"time"
+
+	"github.com/eilandert/gdcc/dcc"
 )
 
-// fakeDccproc writes a stub dccproc that echoes $DCC_OUT and exits $DCC_RC,
-// after draining stdin (gozer feeds the message there).
-func fakeDccproc(t *testing.T) string {
+// DCC target sentinels (include/dcc_proto.h).
+const (
+	dccTgtsMany = 0x00fffff0 // DCC_TGTS_TOO_MANY ("many")
+	dccTgtsOK   = 0x00fffff1 // DCC_TGTS_OK (whitelisted)
+)
+
+// fakeDCC answers DCC queries on UDP, echoing the transaction id and replying to
+// every queried checksum with cur (silent = never reply, a black hole).
+func fakeDCC(t *testing.T, silent bool, cur uint32) (port int, stop func()) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "dccproc")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '%s' \"$DCC_OUT\"\nexit \"${DCC_RC:-0}\"\n"
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil { // #nosec G306 -- test stub must be executable
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
 		t.Fatal(err)
 	}
-	return path
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, ra, err := conn.ReadFromUDP(buf)
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if err != nil || n < 28 || silent {
+				continue
+			}
+			ncks := (n - 24 - 4 - 16) / 18
+			ans := make([]byte, 24+ncks*8+16)
+			binary.BigEndian.PutUint16(ans[0:2], uint16(len(ans))) // #nosec G115 -- answer length is small and bounded
+			ans[2] = 12                                            // pkt_vers
+			ans[3] = 4                                             // DCC_OP_ANSWER
+			copy(ans[8:20], buf[8:20])
+			for i := 0; i < ncks; i++ {
+				binary.BigEndian.PutUint32(ans[24+i*8:], cur)
+			}
+			_, _ = conn.WriteToUDP(ans, ra)
+		}
+	}()
+	return conn.LocalAddr().(*net.UDPAddr).Port, func() { close(done); _ = conn.Close() }
 }
 
-func dccBackend(t *testing.T, out string, rc string) *Backends {
-	t.Setenv("DCC_OUT", out)
-	t.Setenv("DCC_RC", rc)
-	return &Backends{cfg: &Config{Dccproc: fakeDccproc(t), BackendTimeout: 3 * time.Second}, logf: func(string, ...any) {}}
-}
-
-func TestCheckDCCBulkBody(t *testing.T) {
-	b := dccBackend(t, "X-DCC-Brand-Metrics: bulk\nBody=42\n", "0")
-	r := b.checkDCC(nil)
-	if r.Action != "reject" {
-		t.Errorf("bulk should reject, got %q", r.Action)
+func dccBackend(port int) *Backends {
+	return &Backends{
+		cfg:  &Config{BackendTimeout: 2 * time.Second},
+		dcc:  &dcc.Client{Servers: []dcc.Server{{Host: "127.0.0.1", Port: port}}, Timeout: 2 * time.Second},
+		logf: func(string, ...any) {},
 	}
-	if r.Bulk == nil || *r.Bulk != 42 {
+}
+
+const dccProbe = "From: a@b.c\r\nMessage-ID: <x@y>\r\n\r\n" +
+	"The quick brown fox jumps over the lazy dog while the cat watches today here.\r\n"
+
+func TestCheckDCCMany(t *testing.T) {
+	port, stop := fakeDCC(t, false, dccTgtsMany)
+	defer stop()
+	r := dccBackend(port).checkDCC([]byte(dccProbe))
+	if r.Action != "reject" {
+		t.Errorf("many should reject, got %q", r.Action)
+	}
+	if r.Bulk == nil || *r.Bulk != dccTgtsMany {
 		t.Errorf("bulk count: %v", r.Bulk)
 	}
 }
 
-func TestCheckDCCManyAndExitOne(t *testing.T) {
-	b := dccBackend(t, "Body=many\n", "1")
-	r := b.checkDCC(nil)
-	if r.Action != "reject" { // exit 1 also means reject
-		t.Errorf("exit 1 should reject, got %q", r.Action)
-	}
-	if r.Bulk == nil || *r.Bulk != (1<<31)-1 {
-		t.Errorf("many should be 2^31-1, got %v", r.Bulk)
-	}
-}
-
 func TestCheckDCCAccept(t *testing.T) {
-	b := dccBackend(t, "X-DCC: ok\n", "0")
-	r := b.checkDCC(nil)
+	port, stop := fakeDCC(t, false, dccTgtsOK)
+	defer stop()
+	r := dccBackend(port).checkDCC([]byte(dccProbe))
 	if r.Action != "accept" {
-		t.Errorf("clean should accept, got %q", r.Action)
+		t.Errorf("whitelist should accept, got %q", r.Action)
 	}
 	if r.Bulk != nil {
-		t.Errorf("no Body= should be nil bulk, got %v", r.Bulk)
+		t.Errorf("accept should have nil bulk, got %v", r.Bulk)
 	}
 }
 
-func TestCheckDCCMissingBinary(t *testing.T) {
-	b := &Backends{cfg: &Config{Dccproc: "/nonexistent/dccproc", BackendTimeout: time.Second}, logf: func(string, ...any) {}}
-	r := b.checkDCC(nil)
+func TestCheckDCCUnknownLowCount(t *testing.T) {
+	port, stop := fakeDCC(t, false, 5)
+	defer stop()
+	r := dccBackend(port).checkDCC([]byte(dccProbe))
 	if r.Action != "unknown" || r.Bulk != nil {
-		t.Errorf("missing binary should be unknown/nil, got %q/%v", r.Action, r.Bulk)
+		t.Errorf("low count should be unknown/nil, got %q/%v", r.Action, r.Bulk)
+	}
+}
+
+func TestCheckDCCError(t *testing.T) {
+	// 127.0.0.1:1 refuses; a short timeout keeps the test fast.
+	b := &Backends{
+		cfg:  &Config{BackendTimeout: 300 * time.Millisecond},
+		dcc:  &dcc.Client{Servers: []dcc.Server{{Host: "127.0.0.1", Port: 1}}, Timeout: 300 * time.Millisecond},
+		logf: func(string, ...any) {},
+	}
+	r := b.checkDCC([]byte(dccProbe))
+	if r.Action != "unknown" || r.Bulk != nil {
+		t.Errorf("backend error should be unknown/nil, got %q/%v", r.Action, r.Bulk)
 	}
 }
 
 func TestReportDCC(t *testing.T) {
-	if v := dccBackend(t, "", "0").reportDCC(nil); v == nil || !*v {
-		t.Errorf("rc 0 should report true, got %v", v)
-	}
-	if v := dccBackend(t, "", "1").reportDCC(nil); v == nil || *v {
-		t.Errorf("rc 1 should report false, got %v", v)
-	}
-	missing := &Backends{cfg: &Config{Dccproc: "/nonexistent", BackendTimeout: time.Second}, logf: func(string, ...any) {}}
-	if v := missing.reportDCC(nil); v != nil {
-		t.Errorf("missing binary should be nil, got %v", v)
+	port, stop := fakeDCC(t, false, 0)
+	defer stop()
+	if v := dccBackend(port).reportDCC([]byte(dccProbe)); v == nil || !*v {
+		t.Errorf("report to a live server should be true, got %v", v)
 	}
 }
 

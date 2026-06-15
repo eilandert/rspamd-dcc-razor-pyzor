@@ -96,8 +96,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if c.CacheTTL != 300*time.Second || c.MinCf != "ac" {
 		t.Errorf("cache/mincf: %s/%s", c.CacheTTL, c.MinCf)
 	}
-	if c.Dccproc != "/usr/bin/dccproc" {
-		t.Errorf("dccproc: %s", c.Dccproc)
+	if c.DCCServers != "" || c.DCCClientID != 0 || c.DCCClientPass != "" {
+		t.Errorf("dcc defaults: %q/%d/%q", c.DCCServers, c.DCCClientID, c.DCCClientPass)
 	}
 	if c.RazorUser != "" || c.RazorPass != "" {
 		t.Errorf("identity should be empty: %q/%q", c.RazorUser, c.RazorPass)

@@ -1,8 +1,8 @@
 // Package gozer is the in-process DCC/Razor/Pyzor backend for rspamd. It exposes
 // one authenticated HTTP endpoint and answers /check, /report and /revoke by
-// querying the three collaborative-filter networks. Razor and Pyzor are spoken
-// in-process (the gazor and gyzor Go libraries); only DCC is still run out of
-// process, via the dccproc CLI (there is no Go DCC client).
+// querying the three collaborative-filter networks. All three are spoken
+// in-process by Go libraries: gazor (Razor), gyzor (Pyzor) and gdcc (DCC) — no
+// subprocesses, no dccproc fork.
 package gozer
 
 import (
@@ -30,10 +30,16 @@ type Config struct {
 	Verbose bool // GOZER_VERBOSE
 
 	// Backend wiring.
-	Dccproc   string // DCCPROC    (default /usr/bin/dccproc)
 	PyzorHome string // PYZOR_HOME (default /var/lib/pyzor)
 	RazorHome string // RAZORHOME  (default /var/lib/razor)
 	MinCf     string // RAZOR_MIN_CF (default "ac")
+
+	// DCC (in-process via gdcc). Servers is a comma list of host[:port]; empty
+	// uses the public anonymous pool. Identity falls back through DCC_IDS /
+	// /var/dcc/ids to anonymous when id/pass are unset (gdcc.ResolveIdentity).
+	DCCServers    string // DCC_SERVERS
+	DCCClientID   uint32 // DCC_CLIENT_ID        (1 = anonymous)
+	DCCClientPass string // DCC_CLIENT_PASSWD[_FILE]
 
 	// Razor identity for /report and /revoke. Precedence: RAZOR_USER/RAZOR_PASS
 	// env (or _FILE) > the gazor-identity file persisted in RazorHome by
@@ -59,10 +65,12 @@ func LoadConfig() *Config {
 		RedisURL:       strings.TrimSpace(os.Getenv("GOZER_REDIS_URL")),
 		RedisPrefix:    envStr("GOZER_REDIS_PREFIX", "drp:check:"),
 		Verbose:        envBool("GOZER_VERBOSE"),
-		Dccproc:        envStr("DCCPROC", "/usr/bin/dccproc"),
 		PyzorHome:      envStr("PYZOR_HOME", "/var/lib/pyzor"),
 		RazorHome:      envStr("RAZORHOME", "/var/lib/razor"),
 		MinCf:          envStr("RAZOR_MIN_CF", "ac"),
+		DCCServers:     strings.TrimSpace(os.Getenv("DCC_SERVERS")),
+		DCCClientID:    uint32(envInt("DCC_CLIENT_ID", 0)), // #nosec G115 -- client-id is a 32-bit DCC field
+		DCCClientPass:  envOrFile("DCC_CLIENT_PASSWD"),
 	}
 	c.RazorUser, c.RazorPass = loadIdentity(c.RazorHome)
 	return c

@@ -1,10 +1,9 @@
 #!/bin/sh
 # gozer longrun — the static Go HTTP backend that rspamd's dcc_razor_pyzor.lua
-# plugin (and Dovecot's drp-report) query. Razor (gazor) and Pyzor (gyzor) are
-# spoken in-process; DCC is run via dccproc. Runs as the unprivileged `drp` user,
-# NOT root: dccproc is set-UID dcc so DCC still works; the razor identity and
-# pyzor servers live under the homes below (chowned to drp in init-bootstrap).
-# s6 supervises.
+# plugin (and Dovecot's drp-report) query. Razor (gazor), Pyzor (gyzor) and DCC
+# (gdcc) are ALL spoken in-process — no subprocess, no set-UID helper. Runs as
+# the unprivileged `drp` user; the razor identity and pyzor servers live under
+# the homes below (chowned to drp in init-bootstrap). s6 supervises.
 exec 2>&1
 export RAZORHOME="${RAZORHOME:-/var/lib/razor}"
 export PYZOR_HOME="${PYZOR_HOME:-/var/lib/pyzor}"

@@ -50,12 +50,11 @@ services:
     volumes:
       - drp-razor:/var/lib/razor
       - drp-pyzor:/var/lib/pyzor
-      - drp-dcc:/var/dcc
 
     # --- Hardening ---------------------------------------------------------
     read_only: true                 # immutable rootfs; only the mounts + tmpfs writable
     tmpfs:
-      - /run:exec,mode=0755         # s6 runtime + /run/dcc (exec: s6 runs helpers)
+      - /run:exec,mode=0755         # s6 runtime (exec: s6 runs its helpers)
       - /tmp:mode=1777
     cap_drop:
       - ALL
@@ -78,7 +77,6 @@ networks:
 volumes:
   drp-razor:
   drp-pyzor:
-  drp-dcc:
 
 secrets:
   drp_token:

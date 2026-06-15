@@ -1,17 +1,13 @@
 package gozer
 
 import (
-	"bytes"
-	"context"
-	"errors"
-	"io"
-	"os/exec"
-	"regexp"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/eilandert/gazor/razor"
+	"github.com/eilandert/gdcc/dcc"
 	"github.com/eilandert/gyzor/pyzor"
 )
 
@@ -41,8 +37,8 @@ type PyzorResult struct {
 }
 
 // ReportResult is the /report and /revoke response. DCC is a pointer so it can
-// be JSON null: /revoke always reports dcc=null (DCC has no network un-report),
-// and /report reports null when dccproc could not run.
+// be JSON null: /revoke always reports dcc=null (DCC has no network un-report).
+// /report reports true/false (gdcc is in-process and always attempts the send).
 type ReportResult struct {
 	DCC   *bool `json:"dcc"`
 	Razor bool  `json:"razor"`
@@ -58,16 +54,12 @@ func DefaultVerdict() Verdict {
 // DefaultReport is the fail-open /report or /revoke answer (nothing reported).
 func DefaultReport() ReportResult { return ReportResult{} }
 
-var (
-	dccBulkRe = regexp.MustCompile(`(?i)\bbulk\b`)
-	dccBodyRe = regexp.MustCompile(`(?i)Body=(\d+|many)`)
-)
-
-// Backends runs the three collaborative-filter networks. Razor and Pyzor are
-// in-process (gazor / gyzor); DCC is the dccproc CLI. A nil logf is tolerated.
+// Backends runs the three collaborative-filter networks, all in-process:
+// gazor (Razor), gyzor (Pyzor) and gdcc (DCC). A nil logf is tolerated.
 type Backends struct {
 	cfg   *Config
 	pyzor *pyzor.Client
+	dcc   *dcc.Client
 	ident *razor.Identity // nil => report/revoke unavailable for razor
 	logf  func(string, ...any)
 }
@@ -87,6 +79,17 @@ func NewBackends(cfg *Config, logf func(string, ...any)) *Backends {
 		Verbose: cfg.Verbose,
 		Log:     func(line string) { logf("%s", line) },
 	})
+	// DCC identity: explicit env id/pass win, else DCC_IDS / /var/dcc/ids, else
+	// anonymous. Servers default to the public pool when DCC_SERVERS is empty.
+	id := dcc.ResolveIdentity(cfg.DCCClientID, cfg.DCCClientPass)
+	b.dcc = &dcc.Client{
+		Servers:  parseDCCServers(cfg.DCCServers),
+		ClientID: id.ClientID,
+		Password: id.Password,
+		Timeout:  cfg.BackendTimeout,
+		Verbose:  cfg.Verbose,
+		Log:      func(line string) { logf("%s", line) },
+	}
 	if cfg.RazorUser != "" && cfg.RazorPass != "" {
 		b.ident = &razor.Identity{User: cfg.RazorUser, Pass: cfg.RazorPass}
 	}
@@ -144,68 +147,49 @@ func (b *Backends) Revoke(msg []byte) ReportResult {
 	return r
 }
 
-// --- DCC (dccproc CLI) ---
+// --- DCC (gdcc, in-process) ---
 
 func (b *Backends) checkDCC(msg []byte) DCCResult {
-	// dccproc -H -Q: query only (never report/learn), emit the X-DCC header.
-	rc, out, ok := b.runDCC(msg, "-H", "-Q")
-	if !ok {
-		return DCCResult{Action: "unknown"}
+	res, err := b.dcc.Check(msg)
+	if err != nil {
+		return DCCResult{Action: "unknown"} // gdcc already logged the error
 	}
-	var bulk *int
-	if m := dccBodyRe.FindSubmatch(out); m != nil {
-		tok := strings.ToLower(string(m[1]))
-		if tok == "many" {
-			n := (1 << 31) - 1
-			bulk = &n
-		} else if n, err := strconv.Atoi(tok); err == nil {
-			bulk = &n
-		}
-	}
-	action := "accept"
-	if rc == 1 || dccBulkRe.Match(out) {
-		action = "reject"
-	}
-	return DCCResult{Action: action, Bulk: bulk}
+	// A body checksum at DCC "many" rejects (matches dccproc's default
+	// threshold); a server whitelist accepts; otherwise no opinion.
+	v := res.Verdict()
+	return DCCResult{Action: v.Action.String(), Bulk: v.Bulk}
 }
 
 func (b *Backends) reportDCC(msg []byte) *bool {
-	// dccproc WITHOUT -Q actually submits the checksums.
-	rc, _, ok := b.runDCC(msg, "-H")
-	if !ok {
-		return nil // could not run -> JSON null
-	}
-	v := rc == 0
-	return &v
+	ok := b.dcc.Report(msg) == nil // gdcc logs the error itself
+	return &ok
 }
 
-// runDCC runs dccproc feeding msg on stdin. ok is false only if the binary
-// could not be started or timed out; a non-zero exit still returns ok=true with
-// its code (dccproc uses exit 1 to signal "bulk").
-func (b *Backends) runDCC(msg []byte, args ...string) (rc int, out []byte, ok bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), b.cfg.BackendTimeout)
-	defer cancel()
-	// #nosec G204 G702 -- Dccproc is operator config (DCCPROC env, default
-	// /usr/bin/dccproc); args are fixed literals ("-H","-Q"), never user input.
-	cmd := exec.CommandContext(ctx, b.cfg.Dccproc, args...)
-	cmd.Stdin = bytes.NewReader(msg)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = io.Discard
-	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		b.logf("dcc: timeout after %s", b.cfg.BackendTimeout)
-		return 0, nil, false
+// parseDCCServers turns "h1,h2:6277,[::1]:6277" into gdcc servers. Empty -> nil
+// (gdcc then uses the public anonymous pool).
+func parseDCCServers(spec string) []dcc.Server {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
 	}
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return ee.ExitCode(), stdout.Bytes(), true
+	var out []dcc.Server
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
 		}
-		b.logf("dcc: %v", err) // binary missing / failed to start
-		return 0, nil, false
+		host, port := item, 0
+		if h, p, err := net.SplitHostPort(item); err == nil {
+			host = h
+			if n, err := strconv.Atoi(p); err == nil {
+				port = n
+			}
+		} else if strings.HasPrefix(item, "[") && strings.HasSuffix(item, "]") {
+			host = item[1 : len(item)-1]
+		}
+		out = append(out, dcc.Server{Host: host, Port: port})
 	}
-	return 0, stdout.Bytes(), true
+	return out
 }
 
 // --- Razor (gazor, in-process) ---

@@ -10,7 +10,8 @@
 # "<VAR>_FILE" form (Docker/compose secrets): the value is read from that path.
 #
 # gozer runs as the unprivileged `drp` user, so the Razor/Pyzor homes are
-# chowned to drp here. DCC's dccproc is set-UID dcc and uses /var/dcc directly.
+# chowned to drp here. DCC needs nothing on disk — gozer (gdcc) speaks it
+# in-process and reads its config straight from the environment.
 set -eu
 
 echo "[DRP] standalone DCC/Razor/Pyzor backend — docs: https://github.com/eilandert/rspamd-dcc-razor-pyzor"
@@ -35,40 +36,11 @@ if [ -n "${TZ:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# DCC (from the `dcc` package): dccproc (set-UID dcc) queries the DCC servers
-# directly using /var/dcc/map. Identity: DCC_IDS (raw /var/dcc/ids content) takes
-# priority, else DCC_CLIENT_ID (+ DCC_CLIENT_PASSWD) registers a client-id via
-# cdcc, else DCC stays anonymous. Never fatal — DCC degrades to "unknown".
+# DCC is spoken in-process by gozer (gdcc). No /var/dcc, no cdcc, no set-UID dcc
+# helper: gozer reads DCC_SERVERS / DCC_CLIENT_ID / DCC_CLIENT_PASSWD (each with
+# a _FILE form) directly from the environment, and falls back to DCC_IDS /
+# /var/dcc/ids then anonymous. Nothing to bootstrap here.
 # ---------------------------------------------------------------------------
-if command -v cdcc >/dev/null 2>&1; then
-    mkdir -p /run/dcc
-    chown dcc:dcc /run/dcc 2>/dev/null || true
-
-    DCC_IDS="$(resolve DCC_IDS)"
-    DCC_CLIENT_ID="$(resolve DCC_CLIENT_ID)"
-    DCC_CLIENT_PASSWD="$(resolve DCC_CLIENT_PASSWD)"
-
-    if [ -n "${DCC_IDS}" ]; then
-        echo "[DRP] DCC: installing provided ids file"
-        printf '%s\n' "${DCC_IDS}" > /var/dcc/ids
-        chmod 0600 /var/dcc/ids
-    elif [ -n "${DCC_CLIENT_ID}" ]; then
-        echo "[DRP] DCC: registering client-id ${DCC_CLIENT_ID}"
-        if [ -n "${DCC_CLIENT_PASSWD}" ]; then
-            su -s /bin/sh dcc -c "cdcc \"new id ${DCC_CLIENT_ID}; id ${DCC_CLIENT_ID} ${DCC_CLIENT_PASSWD}\"" \
-                2>/dev/null || true
-        else
-            su -s /bin/sh dcc -c "cdcc \"new id ${DCC_CLIENT_ID}\"" 2>/dev/null || true
-        fi
-    fi
-
-    chown -R dcc:dcc /var/dcc 2>/dev/null || true
-    if [ ! -f /var/dcc/map ]; then
-        echo "[DRP] DCC: creating server map"
-        su -s /bin/sh dcc -c 'cdcc "new map; add dcc.dcc-servers.net"' \
-            2>/dev/null || true
-    fi
-fi
 
 # ---------------------------------------------------------------------------
 # Razor (RAZORHOME, owned by drp). The Go backend speaks razor in-process and
