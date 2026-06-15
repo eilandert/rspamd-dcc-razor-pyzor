@@ -34,6 +34,11 @@ type Config struct {
 	RazorHome string // RAZORHOME  (default /var/lib/razor)
 	MinCf     string // RAZOR_MIN_CF (default "ac")
 
+	// DNS-bypass pass-through: per-backend server/discovery overrides forwarded
+	// to gyzor/gazor so the container can skip DNS entirely when it is flaky.
+	PyzorServers   string // GYZOR_SERVERS   (comma host[:port]; empty => homedir/default)
+	RazorDiscovery string // GAZOR_DISCOVERY (comma discovery host[:port]; empty => Razor2 default)
+
 	// DCC (in-process via gdcc). Servers is a comma list of host[:port]; empty
 	// uses the public anonymous pool. Identity falls back through DCC_IDS /
 	// /var/dcc/ids to anonymous when id/pass are unset (gdcc.ResolveIdentity).
@@ -68,6 +73,8 @@ func LoadConfig() *Config {
 		PyzorHome:      envStr("PYZOR_HOME", "/var/lib/pyzor"),
 		RazorHome:      envStr("RAZORHOME", "/var/lib/razor"),
 		MinCf:          envStr("RAZOR_MIN_CF", "ac"),
+		PyzorServers:   strings.TrimSpace(os.Getenv("GYZOR_SERVERS")),
+		RazorDiscovery: strings.TrimSpace(os.Getenv("GAZOR_DISCOVERY")),
 		DCCServers:     strings.TrimSpace(os.Getenv("DCC_SERVERS")),
 		DCCClientID:    uint32(envInt("DCC_CLIENT_ID", 0)), // #nosec G115 -- client-id is a 32-bit DCC field
 		DCCClientPass:  envOrFile("DCC_CLIENT_PASSWD"),

@@ -46,7 +46,10 @@ type Identity struct {
 // Client talks to razor servers. The zero value is usable after setting at
 // least nothing — sensible defaults are filled in by Check/Report/Revoke.
 type Client struct {
-	Discovery  string        // discovery server (default DefaultDiscovery)
+	Discovery   string   // discovery server (default DefaultDiscovery)
+	Discoveries []string // optional discovery-server list; tried in order, first
+	//             that returns servers wins. Bypasses Razor2 DNS-based
+	//             discovery when set. Overrides Discovery when non-empty.
 	Port       int           // server port (default DefaultPort)
 	Server     string        // explicit catalogue/nomination server; skips discovery
 	MinCf      string        // "ac", "ac+N", "ac-N", or a number; default "ac"
@@ -670,14 +673,41 @@ func (c *Client) ensureServer(kind string) error {
 	return lastErr
 }
 
-// discover queries the discovery server for catalogue ("csl") / nomination
-// ("nsl") server lists (Core.pm discover).
+// discoveryList returns the discovery servers to try, in order: the explicit
+// Discoveries list if set, else the single Discovery (or the built-in default).
+func (c *Client) discoveryList() []string {
+	if len(c.Discoveries) > 0 {
+		return c.Discoveries
+	}
+	if c.Discovery != "" {
+		return []string{c.Discovery}
+	}
+	return []string{DefaultDiscovery}
+}
+
+// discover queries the discovery server(s) for catalogue ("csl") / nomination
+// ("nsl") server lists (Core.pm discover). Multiple discovery servers are tried
+// in order; the first that returns a usable list wins (DNS-bypass failover).
 func (c *Client) discover(kind string) ([]string, error) {
 	want := map[string]string{"catalogue": "csl", "nomination": "nsl"}[kind]
-	disc := c.Discovery
-	if disc == "" {
-		disc = DefaultDiscovery
+	var lastErr error
+	for _, disc := range c.discoveryList() {
+		servers, err := c.discoverFrom(disc, want)
+		if err != nil {
+			lastErr = err
+			c.logDbg("discovery %s failed: %v", disc, err)
+			continue
+		}
+		return servers, nil
 	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no discovery servers configured")
+	}
+	return nil, lastErr
+}
+
+// discoverFrom queries a single discovery server for the wanted server list.
+func (c *Client) discoverFrom(disc, want string) ([]string, error) {
 	conn, br, err := c.dial(disc)
 	if err != nil {
 		return nil, fmt.Errorf("discovery dial %s: %w", disc, err)

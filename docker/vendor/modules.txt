@@ -1,13 +1,13 @@
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
-# github.com/eilandert/gazor v0.0.0-20260615002655-08ba389204b2
+# github.com/eilandert/gazor v0.0.0-20260615140047-2e2e7e1ddb03
 ## explicit; go 1.24
 github.com/eilandert/gazor/razor
-# github.com/eilandert/gdcc v0.0.0-20260615124344-2316265e010b
+# github.com/eilandert/gdcc v0.0.0-20260615140128-0df9b690d855
 ## explicit; go 1.23
 github.com/eilandert/gdcc/dcc
-# github.com/eilandert/gyzor v0.0.0-20260615002656-ca468f5d7c9b
+# github.com/eilandert/gyzor v0.0.0-20260615135422-9f8a7740f427
 ## explicit; go 1.24
 github.com/eilandert/gyzor/pyzor
 # github.com/redis/go-redis/v9 v9.20.1

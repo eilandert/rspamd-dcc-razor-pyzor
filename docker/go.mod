@@ -3,9 +3,9 @@ module github.com/eilandert/rspamd-dcc-razor-pyzor
 go 1.24
 
 require (
-	github.com/eilandert/gazor v0.0.0-20260615002655-08ba389204b2
-	github.com/eilandert/gdcc v0.0.0-20260615124344-2316265e010b
-	github.com/eilandert/gyzor v0.0.0-20260615002656-ca468f5d7c9b
+	github.com/eilandert/gazor v0.0.0-20260615140047-2e2e7e1ddb03
+	github.com/eilandert/gdcc v0.0.0-20260615140128-0df9b690d855
+	github.com/eilandert/gyzor v0.0.0-20260615135422-9f8a7740f427
 	github.com/redis/go-redis/v9 v9.20.1
 )
 

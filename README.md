@@ -119,7 +119,7 @@ volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
 |---------|----------|-------------------|
 | Razor | account supplied via `RAZOR_USER`/`RAZOR_PASS` | yes (anonymous) |
 | DCC | `DCC_CLIENT_ID` + `DCC_CLIENT_PASSWD` (or `DCC_IDS`) | yes (anonymous id 1) |
-| Pyzor | optional accounts file / `PYZOR_SERVERS` | yes (anonymous to the public server) |
+| Pyzor | optional accounts file under `PYZOR_HOME` | yes (anonymous to the public server) |
 
 Anonymous is fine for most setups. The image carries **no writable state**;
 to use a **known or shared identity**, provide it through the environment (every
@@ -130,10 +130,23 @@ var also accepts a `<VAR>_FILE` form for Docker secrets — see
 environment:
   DCC_CLIENT_ID: "1234567"
   DCC_CLIENT_PASSWD: "…"          # or DCC_IDS: <path to a DCC ids file>
-  # DCC_SERVERS: "dcc1.dcc-servers.net,dcc2.dcc-servers.net"  # override the pool
   RAZOR_USER: "you@example.com"   # obtain one with `gozer razor-register`
   RAZOR_PASS: "…"
-  PYZOR_SERVERS: "public.pyzor.org:24441"
+```
+
+### DNS-bypass server overrides
+
+When the container's DNS is flaky or the public discovery servers are
+unreachable, each network's server list can be pinned explicitly, bypassing DNS
+discovery entirely. Gozer forwards these to the matching in-process client
+(`gdcc`, `gyzor`, `gazor`); each accepts a comma list of `host[:port]`
+(hostname, IPv4, or bracketed IPv6 `[::1]:port`):
+
+```yaml
+environment:
+  DCC_SERVERS:     "dcc1.dcc-servers.net,dcc2.dcc-servers.net"  # → gdcc
+  GYZOR_SERVERS:   "public.pyzor.org:24441"                     # → gyzor (Pyzor)
+  GAZOR_DISCOVERY: "discovery.razor.cloudmark.com"              # → gazor (Razor), tried in order
 ```
 
 Resolution order per network: **explicit env → existing credential in the volume
@@ -145,19 +158,25 @@ secret never has to sit in the compose file.
 
 ## Configuration
 
-All settings are environment variables on the backend container:
+Every setting is a backend-container **environment variable** and also a
+**`gozer serve` CLI flag** (flag > env > default), so the same option works in
+compose or on the command line. The flag name is the env name lower-cased,
+de-prefixed and hyphenated — e.g. `GOZER_MAX_CONCURRENT` ↔ `--max-concurrent`,
+`GYZOR_SERVERS` ↔ `--pyzor-servers`.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `GOZER_TOKEN` / `GOZER_TOKEN_FILE` | — | Shared secret for POST auth. **Required** — without it every POST returns 503. |
+| `GOZER_HOST` / `GOZER_PORT` | `0.0.0.0` / `8077` | Bind address. |
 | `GOZER_CACHE_TTL` | `300` | Verdict cache lifetime in seconds (`0` disables). Bulk mail repeats, so cache hits are the main speed-up. |
 | `GOZER_CACHE_SIZE` | `4096` | In-memory cache entries (LRU). |
 | `GOZER_REDIS_URL` | — | Use Redis for the cache so **multiple scanners share** it, e.g. `redis://valkey:6379/5`. Otherwise the cache is in-process. |
 | `GOZER_REDIS_PREFIX` | `drp:check:` | Key prefix in Redis. |
 | `GOZER_MAX_CONCURRENT` | `8` | Max in-flight requests (bounds backend fan-out). |
 | `GOZER_BACKEND_TIMEOUT` | `6` | Per-backend timeout in seconds. |
-| `GOZER_VERBOSE` | `0` (off) | Per-request logging — access line plus verdict, timing and cache hit/miss. Off by default (only startup and errors are logged). |
+| `GOZER_VERBOSE` | `0` (off) | Per-request logging — access line plus verdict, timing and cache hit/miss; also dumps the resolved config at startup. Off by default (only startup and errors are logged). |
 | `RAZOR_MIN_CF` | `ac` | Razor minimum confidence: `ac`, `ac+N`, `ac-N`, or a number. |
+| `DCC_SERVERS` / `GYZOR_SERVERS` / `GAZOR_DISCOVERY` | — | DNS-bypass server overrides forwarded to gdcc / gyzor / gazor (see above). |
 | `TZ` | — | Container timezone. |
 
 ## HTTP API
@@ -184,6 +203,13 @@ token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
   no network un-report, so its value is `null`.
 
 - **`GET /health`** — `200 ok`, used by the container healthcheck.
+
+- **`GET /metrics`** — Prometheus exposition (no auth): per-endpoint request
+  counters (`gozer_check_total`, `gozer_report_total`, `gozer_revoke_total`),
+  `gozer_error_total`, `gozer_busy_total`, cache hit/miss, per-backend errors
+  (`gozer_backend_error_total{backend="dcc|razor|pyzor"}`) and a
+  `gozer_latency_seconds` histogram. `gozer stats` fetches and prints it locally
+  (the image ships no curl).
 
 ## Reporting from Dovecot (sieve)
 
@@ -270,6 +296,7 @@ unchanged.
 - Article: <https://deb.myguard.nl/2026/06/rspamd-dcc-razor-pyzor-docker-backend/>
 - gazor (Razor client, imported in-process): <https://github.com/eilandert/gazor>
 - gyzor (Pyzor client, imported in-process): <https://github.com/eilandert/gyzor>
+- gdcc (DCC client, imported in-process): <https://github.com/eilandert/gdcc>
 
 ## License
 

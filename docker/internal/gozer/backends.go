@@ -57,11 +57,12 @@ func DefaultReport() ReportResult { return ReportResult{} }
 // Backends runs the three collaborative-filter networks, all in-process:
 // gazor (Razor), gyzor (Pyzor) and gdcc (DCC). A nil logf is tolerated.
 type Backends struct {
-	cfg   *Config
-	pyzor *pyzor.Client
-	dcc   *dcc.Client
-	ident *razor.Identity // nil => report/revoke unavailable for razor
-	logf  func(string, ...any)
+	cfg     *Config
+	pyzor   *pyzor.Client
+	dcc     *dcc.Client
+	ident   *razor.Identity // nil => report/revoke unavailable for razor
+	logf    func(string, ...any)
+	metrics *Metrics // optional; nil-safe (counts per-backend errors)
 }
 
 // NewBackends wires the pyzor client (servers/accounts loaded from PyzorHome)
@@ -75,6 +76,7 @@ func NewBackends(cfg *Config, logf func(string, ...any)) *Backends {
 	b := &Backends{cfg: cfg, logf: logf}
 	b.pyzor = pyzor.New(pyzor.Config{
 		Home:    cfg.PyzorHome,
+		Servers: parsePyzorServers(cfg.PyzorServers), // GYZOR_SERVERS DNS-bypass; nil => homedir/default
 		Timeout: cfg.BackendTimeout,
 		Verbose: cfg.Verbose,
 		Log:     func(line string) { logf("%s", line) },
@@ -104,11 +106,12 @@ func (b *Backends) HasRazorIdentity() bool { return b.ident != nil }
 // client logs through gozer's logger (errors always; debug when Verbose).
 func (b *Backends) razorClient() *razor.Client {
 	return &razor.Client{
-		Timeout: b.cfg.BackendTimeout,
-		MinCf:   b.cfg.MinCf,
-		Ident:   b.ident,
-		Verbose: b.cfg.Verbose,
-		Log:     func(line string) { b.logf("%s", line) },
+		Discoveries: splitCommaList(b.cfg.RazorDiscovery), // GAZOR_DISCOVERY DNS-bypass; nil => Razor2 default
+		Timeout:     b.cfg.BackendTimeout,
+		MinCf:       b.cfg.MinCf,
+		Ident:       b.ident,
+		Verbose:     b.cfg.Verbose,
+		Log:         func(line string) { b.logf("%s", line) },
 	}
 }
 
@@ -152,6 +155,7 @@ func (b *Backends) Revoke(msg []byte) ReportResult {
 func (b *Backends) checkDCC(msg []byte) DCCResult {
 	res, err := b.dcc.Check(msg)
 	if err != nil {
+		b.metrics.backendError("dcc")
 		return DCCResult{Action: "unknown"} // gdcc already logged the error
 	}
 	// A body checksum at DCC "many" rejects (matches dccproc's default
@@ -192,11 +196,55 @@ func parseDCCServers(spec string) []dcc.Server {
 	return out
 }
 
+// parsePyzorServers turns "h1:24441,h2" into gyzor servers. Empty -> nil (gyzor
+// then uses the PyzorHome servers file or the public default).
+func parsePyzorServers(spec string) []pyzor.Server {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	var out []pyzor.Server
+	for _, item := range strings.Split(spec, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		host, port := item, pyzor.DefaultServer.Port
+		if h, p, err := net.SplitHostPort(item); err == nil {
+			host = h
+			if n, err := strconv.Atoi(p); err == nil {
+				port = n
+			}
+		} else if strings.HasPrefix(item, "[") && strings.HasSuffix(item, "]") {
+			host = item[1 : len(item)-1]
+		}
+		out = append(out, pyzor.Server{Host: host, Port: port})
+	}
+	return out
+}
+
+// splitCommaList splits a comma list into trimmed non-empty entries (nil when
+// empty), for the gazor Discoveries DNS-bypass list.
+func splitCommaList(spec string) []string {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	var out []string
+	for _, item := range strings.Split(spec, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 // --- Razor (gazor, in-process) ---
 
 func (b *Backends) checkRazor(msg []byte) RazorResult {
 	hit, err := b.razorClient().Check(msg)
 	if err != nil {
+		b.metrics.backendError("razor")
 		return RazorResult{Hit: false} // gazor already logged the error
 	}
 	return RazorResult{Hit: hit}
@@ -229,6 +277,9 @@ func (b *Backends) checkPyzor(msg []byte) PyzorResult {
 	// successful servers, the pyzor-correct semantics) and degrades to zero on
 	// unreachable servers, so there is no error path here.
 	res := b.pyzor.Check(msg)
+	if !res.AllOK() {
+		b.metrics.backendError("pyzor") // at least one server failed/unreachable
+	}
 	return PyzorResult{Count: res.Count, WL: res.Whitelist}
 }
 

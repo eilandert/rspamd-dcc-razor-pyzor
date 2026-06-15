@@ -27,16 +27,19 @@ type Engine interface {
 // Server is the HTTP front-end: auth, body limits, the bounded-concurrency
 // gate, the /check verdict cache, and fail-open dispatch to the engine.
 type Server struct {
-	cfg    *Config
-	engine Engine
-	cache  Cache
-	sem    chan struct{}
+	cfg     *Config
+	engine  Engine
+	cache   Cache
+	sem     chan struct{}
+	metrics *Metrics
 }
 
 // NewServer builds the server, its backends and its cache from cfg.
 func NewServer(cfg *Config) *Server {
-	s := &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrent)}
-	s.engine = NewBackends(cfg, s.logf)
+	s := &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics()}
+	b := NewBackends(cfg, s.logf)
+	b.metrics = s.metrics
+	s.engine = b
 	s.cache = NewCache(cfg, s.logf)
 	return s
 }
@@ -44,7 +47,7 @@ func NewServer(cfg *Config) *Server {
 // NewServerWithEngine builds a server around a supplied engine and cache (for
 // tests). A nil cache disables caching.
 func NewServerWithEngine(cfg *Config, engine Engine, cache Cache) *Server {
-	return &Server{cfg: cfg, engine: engine, cache: cache, sem: make(chan struct{}, cfg.MaxConcurrent)}
+	return &Server{cfg: cfg, engine: engine, cache: cache, sem: make(chan struct{}, cfg.MaxConcurrent), metrics: NewMetrics()}
 }
 
 // #nosec G706 -- callers pass internal constant format strings; args are
@@ -85,12 +88,21 @@ func (s *Server) logStartup(addr string) {
 		"razor_identity=%t, verbose=%t, auth=%t)",
 		addr, s.cfg.BackendTimeout, s.cfg.MaxConcurrent, cache, s.cfg.CacheTTL,
 		s.engine.HasRazorIdentity(), s.cfg.Verbose, s.cfg.Token != "")
+	// Under verbose, dump the full resolved config (no secrets) so an operator
+	// can confirm env/flag overrides took effect.
+	s.vlogf("config: pyzor_home=%s razor_home=%s min_cf=%s dcc_servers=%q "+
+		"pyzor_servers=%q razor_discovery=%q cache_size=%d redis=%t max_body=%dB",
+		s.cfg.PyzorHome, s.cfg.RazorHome, s.cfg.MinCf, s.cfg.DCCServers,
+		s.cfg.PyzorServers, s.cfg.RazorDiscovery, s.cfg.CacheSize,
+		s.cfg.RedisURL != "", s.cfg.MaxBody)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/health":
 		writeText(w, http.StatusOK, "ok")
+	case r.Method == http.MethodGet && r.URL.Path == "/metrics":
+		s.metrics.ServeHTTP(w, r)
 	case r.Method == http.MethodPost && isBackendPath(r.URL.Path):
 		s.handlePost(w, r)
 	default:
@@ -115,24 +127,30 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	path := r.URL.Path
+	s.metrics.incPath(path)
+
 	length, err := strconv.ParseInt(r.Header.Get("Content-Length"), 10, 64)
 	if err != nil || length <= 0 || length > s.cfg.MaxBody {
+		s.metrics.inc(&s.metrics.errorTotal)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad length"})
 		return
 	}
 	msg, err := io.ReadAll(io.LimitReader(r.Body, length))
 	if err != nil {
+		s.metrics.inc(&s.metrics.errorTotal)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "read error"})
 		return
 	}
 	t0 := time.Now()
-	path := r.URL.Path
+	defer s.metrics.observeSince(t0)
 
 	// /check is a cacheable idempotent query; /report and /revoke never cache.
 	var cacheKey string
 	if path == "/check" && s.cache != nil {
 		cacheKey = sha256hex(msg)
 		if hit, found := s.cache.Get(cacheKey); found {
+			s.metrics.inc(&s.metrics.cacheHit)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-DRP-Cache", "hit")
 			w.Header().Set("Content-Length", strconv.Itoa(len(hit)))
@@ -141,6 +159,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 			s.vlogf("/check %dB cache=hit %.1fms -> %s", len(msg), msSince(t0), hit)
 			return
 		}
+		s.metrics.inc(&s.metrics.cacheMiss)
 	}
 
 	// Bound in-flight requests: each can fork dccproc and open razor/pyzor
@@ -149,6 +168,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-time.After(s.cfg.BackendTimeout):
+		s.metrics.inc(&s.metrics.busyTotal)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy"})
 		s.logf("%s 503 busy (max_concurrent=%d reached)", path, s.cfg.MaxConcurrent)
 		return
