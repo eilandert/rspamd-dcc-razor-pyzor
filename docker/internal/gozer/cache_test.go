@@ -61,14 +61,14 @@ func TestMemCacheRefreshAtCapacity(t *testing.T) {
 
 func TestNewCacheDisabled(t *testing.T) {
 	cfg := &Config{CacheTTL: 0}
-	if NewCache(cfg, func(string, ...any) {}) != nil {
+	if NewCache(cfg, func(string, ...any) {}, nil) != nil {
 		t.Fatal("TTL<=0 must disable caching")
 	}
 }
 
 func TestNewCacheMemory(t *testing.T) {
 	cfg := &Config{CacheTTL: time.Minute, CacheSize: 8}
-	c := NewCache(cfg, func(string, ...any) {})
+	c := NewCache(cfg, func(string, ...any) {}, nil)
 	if _, ok := c.(*memCache); !ok {
 		t.Fatalf("expected *memCache, got %T", c)
 	}

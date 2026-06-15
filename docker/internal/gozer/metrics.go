@@ -24,6 +24,8 @@ type Metrics struct {
 	cacheHit       uint64
 	cacheMiss      uint64
 	cacheCoalesced uint64
+	redisError     uint64 // Redis L2 operation failures (fail-open)
+	redisCircuit   uint64 // times the Redis circuit breaker opened
 
 	backendErr struct {
 		dcc   uint64
@@ -113,6 +115,8 @@ func (m *Metrics) write(w io.Writer) {
 	counter("gozer_cache_hit_total", "Verdict cache hits.", atomic.LoadUint64(&m.cacheHit))
 	counter("gozer_cache_miss_total", "Verdict cache misses.", atomic.LoadUint64(&m.cacheMiss))
 	counter("gozer_cache_coalesced_total", "Requests sharing an in-flight same-key cache miss.", atomic.LoadUint64(&m.cacheCoalesced))
+	counter("gozer_redis_error_total", "Redis L2 operation failures (fail-open).", atomic.LoadUint64(&m.redisError))
+	counter("gozer_redis_circuit_open_total", "Times the Redis circuit breaker opened.", atomic.LoadUint64(&m.redisCircuit))
 
 	fmt.Fprint(w, "# HELP gozer_backend_error_total Backend errors by network.\n# TYPE gozer_backend_error_total counter\n")
 	fmt.Fprintf(w, "gozer_backend_error_total{backend=\"dcc\"} %d\n", atomic.LoadUint64(&m.backendErr.dcc))

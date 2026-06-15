@@ -27,7 +27,7 @@ type Cache interface {
 // when CacheTTL <= 0. A Redis backend is used when RedisURL is set; if Redis
 // cannot be initialised gozer logs and falls back to the in-process cache,
 // so a misconfigured Redis never disables /check.
-func NewCache(cfg *Config, logf func(string, ...any)) Cache {
+func NewCache(cfg *Config, logf func(string, ...any), m *Metrics) Cache {
 	if cfg.CacheTTL <= 0 {
 		return nil
 	}
@@ -40,6 +40,7 @@ func NewCache(cfg *Config, logf func(string, ...any)) Cache {
 		logf("Redis cache init failed (%v); using in-memory", err)
 		return mem
 	}
+	rc.metrics = m
 	return rc
 }
 
@@ -168,6 +169,7 @@ type redisCache struct {
 	l1         *memCache
 	prefix     string
 	ttl        time.Duration
+	metrics    *Metrics // optional; nil-safe (Redis error/circuit counters)
 	stateMu    sync.Mutex
 	retryAfter time.Time
 }
@@ -265,8 +267,15 @@ func (c *redisCache) redisAllowed() bool {
 
 func (c *redisCache) redisFailed() {
 	c.stateMu.Lock()
+	wasClosed := c.retryAfter.IsZero()
 	c.retryAfter = time.Now().Add(redisRetryDelay)
 	c.stateMu.Unlock()
+	if c.metrics != nil {
+		c.metrics.inc(&c.metrics.redisError)
+		if wasClosed {
+			c.metrics.inc(&c.metrics.redisCircuit) // count each outage onset
+		}
+	}
 }
 
 func (c *redisCache) redisSucceeded() {

@@ -1,6 +1,7 @@
 package gozer
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"strings"
@@ -10,6 +11,17 @@ import (
 	"github.com/eilandert/gdcc/dcc"
 	"github.com/eilandert/gyzor/pyzor"
 )
+
+// opCtx returns a context bounding one backend op by BackendTimeout, plus its
+// cancel. It is intentionally detached from the HTTP request: gozer coalesces
+// same-key misses (single-flight) and caches the result, so the shared backend
+// work must complete for other waiters and the cache even if one caller
+// disconnects — only the per-op total deadline applies. gdcc/gazor honour this
+// as their one total-operation deadline (cancel-on-return frees sockets/
+// goroutines promptly).
+func (b *Backends) opCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), b.cfg.BackendTimeout)
+}
 
 // Verdict is the /check response: one sub-object per network.
 type Verdict struct {
@@ -154,7 +166,9 @@ func (b *Backends) Revoke(msg []byte) ReportResult {
 // --- DCC (gdcc, in-process) ---
 
 func (b *Backends) checkDCC(msg []byte) (DCCResult, bool) {
-	res, err := b.dcc.Check(msg)
+	ctx, cancel := b.opCtx()
+	defer cancel()
+	res, err := b.dcc.CheckContext(ctx, msg)
 	if err != nil {
 		b.metrics.backendError("dcc")
 		return DCCResult{Action: "unknown"}, false // gdcc already logged the error
@@ -166,7 +180,9 @@ func (b *Backends) checkDCC(msg []byte) (DCCResult, bool) {
 }
 
 func (b *Backends) reportDCC(msg []byte) *bool {
-	ok := b.dcc.Report(msg) == nil // gdcc logs the error itself
+	ctx, cancel := b.opCtx()
+	defer cancel()
+	ok := b.dcc.ReportContext(ctx, msg) == nil // gdcc logs the error itself
 	return &ok
 }
 
@@ -243,7 +259,9 @@ func splitCommaList(spec string) []string {
 // --- Razor (gazor, in-process) ---
 
 func (b *Backends) checkRazor(msg []byte) (RazorResult, bool) {
-	hit, err := b.razorClient().Check(msg)
+	ctx, cancel := b.opCtx()
+	defer cancel()
+	hit, err := b.razorClient().CheckContext(ctx, msg)
 	if err != nil {
 		b.metrics.backendError("razor")
 		return RazorResult{Hit: false}, false // gazor already logged the error
@@ -255,7 +273,9 @@ func (b *Backends) reportRazor(msg []byte) bool {
 	if b.ident == nil {
 		return false
 	}
-	if err := b.razorClient().Report(msg); err != nil {
+	ctx, cancel := b.opCtx()
+	defer cancel()
+	if err := b.razorClient().ReportContext(ctx, msg); err != nil {
 		return false // gazor already logged the error
 	}
 	return true
@@ -265,7 +285,9 @@ func (b *Backends) revokeRazor(msg []byte) bool {
 	if b.ident == nil {
 		return false
 	}
-	if err := b.razorClient().Revoke(msg); err != nil {
+	ctx, cancel := b.opCtx()
+	defer cancel()
+	if err := b.razorClient().RevokeContext(ctx, msg); err != nil {
 		return false // gazor already logged the error
 	}
 	return true

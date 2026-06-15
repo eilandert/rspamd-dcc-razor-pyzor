@@ -206,9 +206,10 @@ token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
 
 - **`GET /metrics`** — Prometheus exposition (no auth): per-endpoint request
   counters (`gozer_check_total`, `gozer_report_total`, `gozer_revoke_total`),
-  `gozer_error_total`, `gozer_busy_total`, cache hit/miss, per-backend errors
-  (`gozer_backend_error_total{backend="dcc|razor|pyzor"}`) and a
-  `gozer_latency_seconds` histogram. `gozer stats` fetches and prints it locally
+  `gozer_error_total`, `gozer_busy_total`, cache hit/miss/coalesced, Redis
+  health (`gozer_redis_error_total`, `gozer_redis_circuit_open_total`),
+  per-backend errors (`gozer_backend_error_total{backend="dcc|razor|pyzor"}`)
+  and a `gozer_latency_seconds` histogram. `gozer stats` fetches and prints it locally
   (the image ships no curl).
 
 ### Example

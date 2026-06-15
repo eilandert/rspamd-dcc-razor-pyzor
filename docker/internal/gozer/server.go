@@ -43,7 +43,7 @@ func NewServer(cfg *Config) *Server {
 	b := NewBackends(cfg, s.logf)
 	b.metrics = s.metrics
 	s.engine = b
-	s.cache = NewCache(cfg, s.logf)
+	s.cache = NewCache(cfg, s.logf, s.metrics)
 	return s
 }
 

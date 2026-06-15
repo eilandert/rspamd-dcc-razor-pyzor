@@ -18,6 +18,19 @@ var DefaultServer = Server{Host: "public.pyzor.org", Port: 24441}
 
 const maxPacketSize = 8192
 
+// maxFanout bounds the number of servers queried concurrently per operation, so
+// a very large servers file cannot burst an unbounded number of goroutines/UDP
+// sockets. Beyond this, queries run in bounded waves.
+const maxFanout = 16
+
+// addrTTL bounds reuse of a resolved UDP address before re-resolving.
+const addrTTL = 30 * time.Second
+
+// recvPool reuses the per-query 8 KiB receive buffer to cut allocation under
+// high-volume use. parseResponse copies the fields it keeps, so the buffer is
+// safe to return to the pool after a query.
+var recvPool = sync.Pool{New: func() any { b := make([]byte, maxPacketSize); return &b }}
+
 // Server is a pyzor server address.
 type Server struct {
 	Host string
@@ -40,6 +53,46 @@ type Client struct {
 	// stderr when Log is nil — the shim points Log at its own logger.
 	Verbose bool
 	Log     func(string)
+
+	addrMu    sync.Mutex           // guards addrCache
+	addrCache map[string]addrEntry // resolved UDP addr cache (short TTL)
+}
+
+type addrEntry struct {
+	addr *net.UDPAddr
+	exp  time.Time
+}
+
+// resolve returns a (cached) UDP address for s, re-resolving after addrTTL.
+// Resolution failures are not cached. Safe for the shared Client gozer reuses.
+func (c *Client) resolve(s Server) (*net.UDPAddr, error) {
+	key := s.addr()
+	now := time.Now()
+	c.addrMu.Lock()
+	if e, ok := c.addrCache[key]; ok && now.Before(e.exp) {
+		c.addrMu.Unlock()
+		return e.addr, nil
+	}
+	c.addrMu.Unlock()
+
+	addr, err := net.ResolveUDPAddr("udp", key)
+	if err != nil {
+		return nil, err
+	}
+	c.addrMu.Lock()
+	if c.addrCache == nil {
+		c.addrCache = make(map[string]addrEntry)
+	}
+	c.addrCache[key] = addrEntry{addr: addr, exp: now.Add(addrTTL)}
+	c.addrMu.Unlock()
+	return addr, nil
+}
+
+// invalidateAddr drops a cached address after an I/O failure.
+func (c *Client) invalidateAddr(s Server) {
+	c.addrMu.Lock()
+	delete(c.addrCache, s.addr())
+	c.addrMu.Unlock()
 }
 
 // emit writes one preformatted log line to Log, or stderr if Log is nil.
@@ -228,10 +281,15 @@ func (c *Client) broadcast(mk func() *request) bool {
 func (c *Client) queryAll(mk func() *request) []ServerResult {
 	results := make([]ServerResult, len(c.Servers))
 	var wg sync.WaitGroup
+	// Bound concurrent goroutines/sockets so a huge servers list cannot burst
+	// unbounded fan-out; beyond maxFanout, queries proceed in waves.
+	sem := make(chan struct{}, maxFanout)
 	for i, s := range c.Servers {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(i int, s Server) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			sr := ServerResult{Server: s}
 			resp, err := c.query(s, mk())
 			if err != nil {
@@ -262,26 +320,29 @@ func (c *Client) query(s Server, req *request) (*response, error) {
 	thread := generateThread()
 	packet := req.serialize(c.account(s), time.Now().Unix(), thread)
 
-	raddr, err := net.ResolveUDPAddr("udp", s.addr())
+	raddr, err := c.resolve(s)
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", s, err)
 	}
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
+		c.invalidateAddr(s) // re-resolve next time instead of waiting out the TTL
 		return nil, fmt.Errorf("dial %s: %w", s, err)
 	}
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(c.Timeout))
 	if _, err := conn.Write(packet); err != nil {
+		c.invalidateAddr(s)
 		return nil, fmt.Errorf("send %s: %w", s, err)
 	}
-	buf := make([]byte, maxPacketSize)
-	n, err := conn.Read(buf)
+	bufp := recvPool.Get().(*[]byte)
+	defer recvPool.Put(bufp)
+	n, err := conn.Read(*bufp)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", s, err)
 	}
-	resp := parseResponse(buf[:n])
+	resp := parseResponse((*bufp)[:n])
 	if err := resp.validate(thread); err != nil {
 		return nil, fmt.Errorf("%s: %w", s, err)
 	}

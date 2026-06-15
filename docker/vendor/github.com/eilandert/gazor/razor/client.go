@@ -8,6 +8,7 @@ package razor
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -78,6 +79,52 @@ type Client struct {
 	engines     map[int]bool
 	minCfVal    int
 	authed      bool
+
+	// opCtx/opDeadline bound ONE public operation (set under mu in the entry
+	// points). opDeadline is the single total budget for the whole op —
+	// discovery, failover, state negotiation, auth and every query batch share
+	// it instead of each phase getting a fresh full Timeout.
+	opCtx      context.Context
+	opDeadline time.Time
+}
+
+// beginOp installs the per-operation context and total deadline. ctx==nil is
+// treated as context.Background. Called under mu at the start of each public op.
+func (c *Client) beginOp(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.opCtx = ctx
+	c.opDeadline = time.Now().Add(c.timeout())
+	if d, ok := ctx.Deadline(); ok && d.Before(c.opDeadline) {
+		c.opDeadline = d
+	}
+}
+
+func (c *Client) endOp() {
+	c.opCtx = nil
+	c.opDeadline = time.Time{}
+}
+
+// budget is the remaining time for the current op, used for each network
+// dial/read so the whole operation cannot exceed opDeadline. A floor keeps a
+// final attempt from using a zero/negative deadline (which never times out).
+func (c *Client) budget() time.Duration {
+	if c.opDeadline.IsZero() {
+		return c.timeout()
+	}
+	if rem := time.Until(c.opDeadline); rem > time.Millisecond {
+		return rem
+	}
+	return time.Millisecond
+}
+
+// opErr reports the current op's context error (cancelled/expired), or nil.
+func (c *Client) opErr() error {
+	if c.opCtx != nil {
+		return c.opCtx.Err()
+	}
+	return nil
 }
 
 func (c *Client) timeout() time.Duration {
@@ -158,8 +205,16 @@ func Signatures(mail []byte) []PartSig {
 
 // Check returns whether mail (a raw RFC822 message) is known spam.
 func (c *Client) Check(mail []byte) (bool, error) {
+	return c.CheckContext(context.Background(), mail)
+}
+
+// CheckContext is Check bounded by ctx: ctx's deadline (or Timeout) caps the
+// whole operation, and a cancelled ctx aborts discovery/negotiation/queries.
+func (c *Client) CheckContext(ctx context.Context, mail []byte) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.beginOp(ctx)
+	defer c.endOp()
 	spam, err := c.checkLocked(mail)
 	if err != nil {
 		c.logErr("check failed: %v", err)
@@ -204,6 +259,8 @@ func (c *Client) checkLocked(mail []byte) (bool, error) {
 func (c *Client) CheckSig(engine int, sig, ep4 string) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.beginOp(context.Background())
+	defer c.endOp()
 	if err := c.ensureCatalogue(); err != nil {
 		return false, err
 	}
@@ -234,8 +291,11 @@ func (c *Client) CheckSig(engine int, sig, ep4 string) (bool, error) {
 }
 
 // Report submits mail as spam to a nomination server (requires Ident).
-func (c *Client) Report(mail []byte) error {
-	err := c.reportOrRevoke(mail, false)
+func (c *Client) Report(mail []byte) error { return c.ReportContext(context.Background(), mail) }
+
+// ReportContext is Report bounded by ctx.
+func (c *Client) ReportContext(ctx context.Context, mail []byte) error {
+	err := c.reportOrRevoke(ctx, mail, false)
 	if err != nil {
 		c.logErr("report failed: %v", err)
 	} else {
@@ -245,8 +305,11 @@ func (c *Client) Report(mail []byte) error {
 }
 
 // Revoke retracts a prior spam report for mail (requires Ident).
-func (c *Client) Revoke(mail []byte) error {
-	err := c.reportOrRevoke(mail, true)
+func (c *Client) Revoke(mail []byte) error { return c.RevokeContext(context.Background(), mail) }
+
+// RevokeContext is Revoke bounded by ctx.
+func (c *Client) RevokeContext(ctx context.Context, mail []byte) error {
+	err := c.reportOrRevoke(ctx, mail, true)
 	if err != nil {
 		c.logErr("revoke failed: %v", err)
 	} else {
@@ -431,9 +494,11 @@ func (c *Client) checkLogic(parts []*part) bool {
 
 // --- report / revoke ---
 
-func (c *Client) reportOrRevoke(mail []byte, revoke bool) error {
+func (c *Client) reportOrRevoke(ctx context.Context, mail []byte, revoke bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.beginOp(ctx)
+	defer c.endOp()
 	if c.Ident == nil || c.Ident.User == "" {
 		return errors.New("report/revoke requires an Identity (register first)")
 	}
@@ -611,6 +676,8 @@ func buildReportChunks(headers []byte, parts []*part, bqs int) []string {
 func (c *Client) Register(user, pass string) (*Identity, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.beginOp(context.Background())
+	defer c.endOp()
 	if err := c.ensureNomination(); err != nil {
 		return nil, err
 	}
@@ -677,22 +744,73 @@ func (c *Client) ensureServer(kind string) error {
 	if c.Server != "" {
 		return c.connectAndPrepare(c.Server)
 	}
-	servers, err := c.discover(kind)
-	if err != nil {
-		return err
+	// Reuse a recently discovered server list so fresh per-request clients
+	// (gozer builds one per message) don't repeat the separate discovery TCP
+	// handshake every time. The list is just hostnames; a short TTL picks up
+	// Cloudmark changes, and an all-candidates-failed result re-discovers.
+	cacheKey := kind + "\x00" + strings.Join(c.discoveryList(), ",")
+	servers, cached := discCacheGet(cacheKey)
+	if !cached {
+		var err error
+		servers, err = c.discover(kind)
+		if err != nil {
+			return err
+		}
+		discCachePut(cacheKey, servers)
 	}
 	var lastErr error
 	for _, s := range servers {
+		if err := c.opErr(); err != nil {
+			return err // cancelled/expired — stop trying candidates
+		}
 		if err := c.connectAndPrepare(s); err == nil {
 			return nil
 		} else {
 			lastErr = err
 		}
 	}
+	// every candidate failed — drop the cached list so the next op re-discovers
+	discCacheDel(cacheKey)
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no %s servers discovered", kind)
 	}
 	return lastErr
+}
+
+// discCache is a process-global, concurrency-safe short-TTL cache of discovered
+// catalogue/nomination server lists, shared across the fresh Clients gozer
+// builds per request so discovery is not repeated on every message.
+var (
+	discMu    sync.Mutex
+	discCache = map[string]discEntry{}
+)
+
+type discEntry struct {
+	servers []string
+	exp     time.Time
+}
+
+const discCacheTTL = 5 * time.Minute
+
+func discCacheGet(key string) ([]string, bool) {
+	discMu.Lock()
+	defer discMu.Unlock()
+	if e, ok := discCache[key]; ok && time.Now().Before(e.exp) {
+		return e.servers, true
+	}
+	return nil, false
+}
+
+func discCachePut(key string, servers []string) {
+	discMu.Lock()
+	discCache[key] = discEntry{servers: servers, exp: time.Now().Add(discCacheTTL)}
+	discMu.Unlock()
+}
+
+func discCacheDel(key string) {
+	discMu.Lock()
+	delete(discCache, key)
+	discMu.Unlock()
 }
 
 // discoveryList returns the discovery servers to try, in order: the explicit
@@ -735,7 +853,7 @@ func (c *Client) discoverFrom(disc, want string) ([]string, error) {
 		return nil, fmt.Errorf("discovery dial %s: %w", disc, err)
 	}
 	defer conn.Close()
-	if _, err := readGreeting(conn, br, c.timeout()); err != nil {
+	if _, err := readGreeting(conn, br, c.budget()); err != nil {
 		return nil, err
 	}
 	c.conn, c.br = conn, br
@@ -763,11 +881,14 @@ func (c *Client) discoverFrom(disc, want string) ([]string, error) {
 // connectAndPrepare dials a server, parses the greeting, fetches its state
 // (a=g&pm=state), and computes the engine set + min_cf (compute_server_conf).
 func (c *Client) connectAndPrepare(server string) error {
+	if err := c.opErr(); err != nil {
+		return err // cancelled/expired before dialing
+	}
 	conn, br, err := c.dial(server)
 	if err != nil {
 		return err
 	}
-	greeting, err := readGreeting(conn, br, c.timeout())
+	greeting, err := readGreeting(conn, br, c.budget())
 	if err != nil {
 		_ = conn.Close()
 		return err
@@ -850,7 +971,7 @@ func (c *Client) computeMinCf() int {
 // --- low-level network ---
 
 func (c *Client) dial(server string) (net.Conn, *bufio.Reader, error) {
-	conn, err := net.DialTimeout("tcp", c.serverAddr(server), c.timeout())
+	conn, err := net.DialTimeout("tcp", c.serverAddr(server), c.budget())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -900,10 +1021,13 @@ func (c *Client) send(msgs []string) ([]string, error) {
 	}
 	out := make([]string, 0, len(msgs))
 	for _, m := range msgs {
+		if err := c.opErr(); err != nil {
+			return nil, err // cancelled/expired between batches
+		}
 		if err := c.writeMsg(m); err != nil {
 			return nil, err
 		}
-		r, err := readResponse(c.conn, c.br, c.timeout())
+		r, err := readResponse(c.conn, c.br, c.budget())
 		if err != nil {
 			return nil, err
 		}
@@ -925,7 +1049,7 @@ func (c *Client) sendNoRead(msgs []string) ([]string, error) {
 }
 
 func (c *Client) writeMsg(m string) error {
-	if err := c.conn.SetWriteDeadline(time.Now().Add(c.timeout())); err != nil {
+	if err := c.conn.SetWriteDeadline(time.Now().Add(c.budget())); err != nil {
 		return err
 	}
 	_, err := c.conn.Write([]byte(m))
