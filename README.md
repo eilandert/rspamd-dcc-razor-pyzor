@@ -41,7 +41,7 @@ Inside the image (supervised by s6-overlay):
 
 `dccproc` talks to the DCC servers directly (no `dccifd` daemon needed). Every
 backend is **best-effort**: if one network is unreachable it simply doesn't
-score, and the container stays healthy — the healthcheck only depends on the
+score, and the container stays healthy — the healthcheck only depends on
 gozer's `/health`.
 
 **Hardening:** gozer runs non-root with bounded concurrency, every POST is
@@ -235,10 +235,40 @@ In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo
 is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 `docker buildx bake debian-rspamd-drp`.
 
-> **Packages:** `dcc`, `razor` and `pyzor` come from our own Debian packages on
-> [deb.myguard.nl](https://deb.myguard.nl) (the apt repo and signing key are
-> already in `eilandert/debian-base`). DCC isn't in Debian proper for licence
-> reasons; the `dcc` package provides `dccifd`, `dccproc` and `cdcc`.
+> **Packages:** only `dcc` is installed at runtime — Razor and Pyzor are linked
+> in via gazor/gyzor, so there is no perl or python in the image. `dcc` comes from
+> our own Debian package on [deb.myguard.nl](https://deb.myguard.nl) (the apt repo
+> and signing key are already in `eilandert/debian-base`); DCC isn't in Debian
+> proper for licence reasons. The backend uses `dccproc` (and `cdcc` at bootstrap);
+> the `dccifd` daemon the package also ships is not run.
+
+## The Go rewrite: gazor, gyzor, gozer
+
+Earlier versions of this backend were a thin Python HTTP shim that, for every
+message, forked the perl `razor-check` / `razor-report` and the python `pyzor`
+CLIs (alongside `dccproc`). That meant an interpreter start per check and a
+perl + python toolchain baked into the image. The two clients were rewritten
+from scratch in Go and are now linked into the backend in-process:
+
+| Was (per-message fork) | Now (in-process Go) | What it is |
+|------------------------|---------------------|------------|
+| perl `razor-agents` (Razor2) | [gazor](https://github.com/eilandert/gazor) | Go razor client |
+| python `pyzor` | [gyzor](https://github.com/eilandert/gyzor) | Go pyzor client |
+| python `spamcheck_shim.py` | **gozer** | this backend — the binary in the image |
+
+DCC has no Go client, so it is still run as a `dccproc` fork — the only
+per-message process left.
+
+gazor and gyzor speak their wire protocols byte-for-byte compatibly with the
+reference perl/python clients (each is gated by parity tests against real razor
+and pyzor in its own CI), so the servers see identical fingerprints and the
+switch is invisible on the wire. Dropping the perl and python runtimes took the
+image from roughly 268 MB to 176 MB, and a check no longer forks an interpreter.
+
+Upgrading from an older build: the backend's environment variables were renamed
+`SHIM_*` to `GOZER_*` (for example `SHIM_TOKEN` becomes `GOZER_TOKEN`). The HTTP
+contract, the `X-DRP-*` headers, and `drp-report`'s `DRP_URL` / `DRP_TOKEN` are
+unchanged.
 
 ## See also
 
