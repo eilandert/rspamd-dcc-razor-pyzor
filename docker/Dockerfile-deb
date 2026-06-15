@@ -1,16 +1,16 @@
 # syntax=docker/dockerfile:1.7
-# Standalone DCC/Razor/Pyzor backend for rspamd, supervised by s6-overlay.
-# This image runs NO rspamd. It exposes one authenticated HTTP endpoint (:8077)
-# that rspamd's dcc_razor_pyzor.lua plugin (in a SEPARATE container) queries.
-#   * gozer — a single static Go binary that speaks Razor (gazor), Pyzor
-#     (gyzor) and DCC (gdcc) ALL IN-PROCESS. It replaces the old Python
-#     implementation that forked the perl razor-*, python pyzor and dccproc CLIs
-#     per message; there are now NO per-message forks at all. gozer runs as the
-#     unprivileged `drp` user.
+# Standalone DCC/Razor/Pyzor backend for rspamd — a single static Go binary on a
+# distroless base. This image runs NO rspamd. It exposes one authenticated HTTP
+# endpoint (:8077) that rspamd's dcc_razor_pyzor.lua plugin (in a SEPARATE
+# container) queries.
+#   * gozer — speaks Razor (gazor), Pyzor (gyzor) and DCC (gdcc) ALL IN-PROCESS.
+#     It replaces the old Python implementation that forked the perl razor-*,
+#     python pyzor and dccproc CLIs per message; there are now NO per-message
+#     forks and NO supervisor — gozer is the entrypoint, running as nonroot.
 #
-# No collaborative-filter packages are installed: razor/pyzor/perl/python AND the
-# dcc package (dccproc/cdcc, set-UID dcc, /var/dcc) are all gone — gazor, gyzor
-# and gdcc are linked into the Go binary, which talks to the networks directly.
+# Nothing else is installed: no razor/pyzor/perl/python, no dcc package
+# (dccproc/cdcc, set-UID dcc, /var/dcc), no s6-overlay, no shell. gazor, gyzor
+# and gdcc are linked into the binary, which talks to the networks directly.
 ARG GO_VERSION=1.24
 
 # --- build stage: compile the static gozer binary (fully offline: deps are
@@ -26,69 +26,32 @@ RUN CGO_ENABLED=0 go build -mod=vendor -trimpath \
       -ldflags="-s -w -X main.version=${GOZER_VERSION}" \
       -o /out/gozer ./cmd/gozer
 
-# --- runtime stage --------------------------------------------------------------
-FROM eilandert/debian-base:stable
+# --- runtime stage: distroless static, nonroot, no shell ------------------------
+# All three networks are linked into the single static gozer binary, so the
+# runtime needs nothing but the binary and CA roots (for the razor/pyzor TLS
+# handshakes; DCC is plain UDP). No Debian base, no s6, no apt, no shell.
+FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.authors="eilandert"
 LABEL org.opencontainers.image.source="https://github.com/eilandert/rspamd-dcc-razor-pyzor"
 LABEL maintainer="Thijs Eilander <eilander@myguard.nl>"
 
-ENV DEBIAN_FRONTEND="noninteractive" \
-    RAZORHOME=/var/lib/razor \
-    PYZOR_HOME=/var/lib/pyzor \
-    S6_KEEP_ENV=1 \
-    S6_CMD_WAIT_FOR_SERVICES_MAXTIME=0 \
-    S6_BEHAVIOUR_IF_STAGE2_FAILS=2
+# gozer reads ALL config from the environment (GOZER_*, DCC_*, RAZOR_*, PYZOR_*).
+# The image has no writable state: /check works anonymously; for /report supply
+# RAZOR_USER/RAZOR_PASS (or their _FILE forms) — obtain an anonymous razor
+# credential with `gozer razor-register`.
+ENV GOZER_HOST=0.0.0.0 \
+    GOZER_PORT=8077
 
-ARG S6_OVERLAY_VERSION=3.2.1.0
+COPY --from=build /out/gozer /usr/local/bin/gozer
 
-RUN set -ex; \
-    apt-get -y update; \
-    apt-get --no-install-recommends -y install ca-certificates curl xz-utils; \
-    # All three networks (DCC/Razor/Pyzor) are linked into gozer — no dcc
-    # package, no razor/pyzor/perl/python, no per-message subprocess.
-    # s6-overlay (verify sha256 against the upstream checksum files).
-    cd /tmp; \
-    for f in s6-overlay-noarch.tar.xz s6-overlay-x86_64.tar.xz; do \
-      base="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
-      curl -fsSL "${base}/${f}"        -o "${f}"; \
-      curl -fsSL "${base}/${f}.sha256" -o "${f}.sha256"; \
-      sha256sum -c "${f}.sha256"; \
-      tar -C / -Jxpf "${f}"; \
-      rm -f "${f}" "${f}.sha256"; \
-    done; \
-    # Unprivileged user gozer runs as (parses hostile message bytes).
-    adduser --system --group --no-create-home --home /var/lib/drp drp; \
-    mkdir -p "${RAZORHOME}" "${PYZOR_HOME}"; \
-    chown -R drp:drp "${RAZORHOME}" "${PYZOR_HOME}"; \
-    # Build-only: xz-utils was needed solely to extract s6. curl stays (used by
-    # the HEALTHCHECK at runtime).
-    apt-get -y purge xz-utils; \
-    apt-get -y autoremove; \
-    apt-get -y clean autoclean; \
-    # Slim: drop docs/man/locale/info. No perl/python interpreters to keep now.
-    rm -rf /var/lib/apt/lists/* /var/cache/apt \
-           /usr/share/man /usr/local/share/man /usr/share/doc /usr/share/info \
-           /usr/share/locale/*
-
-# The static Go backend + the s6 service tree.
-COPY --from=build --chmod=0755 /out/gozer /usr/local/bin/gozer
-COPY root/ /
-COPY --chmod=0755 healthcheck.sh /healthcheck.sh
-
-RUN set -ex; \
-    chmod 0755 /etc/s6-overlay/scripts/init-bootstrap.sh \
-               /etc/s6-overlay/s6-rc.d/gozer/run
-
-# Persist identities/state so they survive container recreation.
-VOLUME [ "/var/lib/razor", "/var/lib/pyzor" ]
-
-# gozer HTTP endpoint queried by the external rspamd plugin. Reachable
-# on the docker network only — do NOT publish to the host (see docker-compose).
+# gozer HTTP endpoint queried by the external rspamd plugin. Reachable on the
+# docker network only — do NOT publish to the host (see docker-compose).
 EXPOSE 8077
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD /healthcheck.sh || exit 1
+# distroless ships no shell or curl; gozer probes its own /health endpoint.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/gozer", "health"]
 
+USER nonroot
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/init"]
-CMD []
+ENTRYPOINT ["/usr/local/bin/gozer", "serve"]

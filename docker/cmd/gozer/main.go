@@ -1,23 +1,26 @@
-// Command gozer is the standalone DCC/Razor/Pyzor backend for rspamd. It
-// imports gazor (razor) and gyzor (pyzor) in-process and runs DCC via the
-// dccproc CLI, replacing the earlier original Python implementation that forked the perl razor and
-// python pyzor CLIs per message.
+// Command gozer is the standalone DCC/Razor/Pyzor backend for rspamd. It speaks
+// all three networks in-process — gazor (razor), gyzor (pyzor) and gdcc (DCC) —
+// replacing the earlier Python implementation that forked the perl razor,
+// python pyzor and dccproc CLIs per message.
 //
 // Usage:
 //
 //	gozer [serve]               run the HTTP backend on GOZER_HOST:GOZER_PORT
+//	gozer health                probe the local /health endpoint (HEALTHCHECK)
 //	gozer razor-register [...]  obtain a razor identity and persist it
 //	gozer version               print the version
 //
-// razor-register is used by the container's init-bootstrap to create/persist
-// the razor credential gozer needs for /report and /revoke.
+// razor-register obtains the razor credential gozer needs for /report and
+// /revoke; pass it back via RAZOR_USER/RAZOR_PASS (or their _FILE forms).
 package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,12 +50,38 @@ func run(args []string) int {
 	switch cmd {
 	case "serve":
 		return cmdServe()
+	case "health":
+		return cmdHealth()
 	case "razor-register":
 		return cmdRegister(args)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: gozer [serve|razor-register|version]")
+		fmt.Fprintln(os.Stderr, "usage: gozer [serve|health|razor-register|version]")
 		return 2
 	}
+}
+
+// cmdHealth probes the local /health endpoint and exits 0/1. It is the
+// container HEALTHCHECK in the distroless image, which ships no shell or curl;
+// it reads the same GOZER_HOST/GOZER_PORT the server binds.
+func cmdHealth() int {
+	cfg := gozer.LoadConfig()
+	host := cfg.Host
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	url := "http://" + host + ":" + strconv.Itoa(cfg.Port) + "/health"
+	c := &http.Client{Timeout: 3 * time.Second}
+	resp, err := c.Get(url)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "health:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "health: status", resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 func cmdServe() int {

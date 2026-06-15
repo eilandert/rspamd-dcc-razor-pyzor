@@ -12,37 +12,34 @@ at this backend.
 **Why a separate backend?** rspamd has a built-in DCC module but nothing for
 Razor or Pyzor, and shelling out to those CLIs from inside the rspamd worker
 would block its event loop. This service is a single static Go binary that
-speaks **Razor and Pyzor in-process** (the [gazor](https://github.com/eilandert/gazor)
-and [gyzor](https://github.com/eilandert/gyzor) libraries) and runs **DCC** via
-`dccproc`, answering over HTTP — so the plugin stays fully asynchronous and a
-single request covers all three networks at once, with no per-message perl/python
-process forks.
+speaks **all three networks in-process** — Razor, Pyzor and DCC via the
+[gazor](https://github.com/eilandert/gazor),
+[gyzor](https://github.com/eilandert/gyzor) and
+[gdcc](https://github.com/eilandert/gdcc) libraries — answering over HTTP, so
+the plugin stays fully asynchronous and a single request covers all three
+networks at once, with **no per-message subprocess forks at all**.
 
 ## How it works
 
 ```
   ┌──────────────────────┐   HTTP :8077 + token   ┌────────────────────────────┐
   │  rspamd (your image)  │ ─────────────────────► │  rspamd-dcc-razor-pyzor     │
-  │  dcc_razor_pyzor.lua  │  POST /check (message) │  gozer  (s6, drp)           │
-  └──────────────────────┘ ◄───────────────────── │   ├─ dccproc (set-UID dcc)  │
-                              JSON verdict         │   ├─ gazor  (Razor, in-proc)│
-                                                   │   └─ gyzor  (Pyzor, in-proc)│
+  │  dcc_razor_pyzor.lua  │  POST /check (message) │  gozer  (distroless, nonroot)│
+  └──────────────────────┘ ◄───────────────────── │   ├─ gdcc   (DCC,   in-proc) │
+                              JSON verdict         │   ├─ gazor  (Razor, in-proc) │
+                                                   │   └─ gyzor  (Pyzor, in-proc) │
                                                    └────────────────────────────┘
 ```
 
-Inside the image (supervised by s6-overlay):
-
-- **`gozer`** — the static Go HTTP server on `:8077` running as the
-  unprivileged `drp` user. It queries the three networks **concurrently**
-  (Razor/Pyzor in-process, DCC via `dccproc`) and caches verdicts (see
-  [Configuration](#configuration)).
-- **`init-bootstrap`** — one-shot setup of the DCC map, Razor identity and Pyzor
-  server list.
-
-`dccproc` talks to the DCC servers directly (no `dccifd` daemon needed). Every
-backend is **best-effort**: if one network is unreachable it simply doesn't
-score, and the container stays healthy — the healthcheck only depends on
-gozer's `/health`.
+The image is a single ~19 MB static `gozer` binary on a `distroless/static`
+base — no Debian, no s6 supervisor, no shell, no per-message fork. `gozer` is
+the container entrypoint and runs as `nonroot`. It queries the three networks
+**concurrently**, all in-process, and caches verdicts (see
+[Configuration](#configuration)). All three talk to their servers directly
+(DCC needs no `dccifd` daemon). Every backend is **best-effort**: if one network
+is unreachable it simply doesn't score, and the container stays healthy — the
+healthcheck only depends on gozer's `/health` (probed by `gozer health`, since
+the image ships no shell or curl).
 
 **Hardening:** gozer runs non-root with bounded concurrency, every POST is
 **token-authenticated**, and the bundled compose runs the container read-only
@@ -50,8 +47,8 @@ with `cap_drop: ALL`, `no-new-privileges`, and no published host port.
 
 ### Privacy: the message never touches disk
 
-Gozer keeps the message in memory: Razor and Pyzor are computed in-process,
-and DCC is fed to `dccproc` over **stdin** — nothing is written to a temp file.
+Gozer keeps the message in memory: all three checksums (Razor, Pyzor and DCC)
+are computed in-process — nothing is ever written to a temp file.
 The cache stores only `sha256(body) → verdict` (never the body itself), and the
 same goes for the optional Redis backend, so no message content is ever persisted
 locally.
@@ -120,22 +117,21 @@ volumes (`drp-razor`, `drp-dcc`, `drp-pyzor`):
 
 | Network | Identity | Anonymous default |
 |---------|----------|-------------------|
-| Razor | nomination credential auto-registered by `gozer` | yes (random identity) |
-| DCC | client-id in `/var/dcc/ids` | yes (anonymous id) |
-| Pyzor | optional accounts file | yes (anonymous to the public server) |
+| Razor | account supplied via `RAZOR_USER`/`RAZOR_PASS` | yes (anonymous) |
+| DCC | `DCC_CLIENT_ID` + `DCC_CLIENT_PASSWD` (or `DCC_IDS`) | yes (anonymous id 1) |
+| Pyzor | optional accounts file / `PYZOR_SERVERS` | yes (anonymous to the public server) |
 
-Anonymous is fine for most setups. To use a **known or shared identity** — one
-that survives a volume reset or is reused across instances — provide it through
-the environment (see [`docker/docker-compose.yml`](docker/docker-compose.yml)):
+Anonymous is fine for most setups. The image carries **no writable state**;
+to use a **known or shared identity**, provide it through the environment (every
+var also accepts a `<VAR>_FILE` form for Docker secrets — see
+[`docker/docker-compose.yml`](docker/docker-compose.yml)):
 
 ```yaml
 environment:
   DCC_CLIENT_ID: "1234567"
-  DCC_CLIENT_PASSWD: "…"          # or DCC_IDS: <whole /var/dcc/ids file>
-  RAZOR_REGISTER_USER: "you@example.com"   # register/link this account
-  RAZOR_REGISTER_PASS: "…"
-  # or, for an account you already hold, skip registration and supply it directly:
-  RAZOR_USER: "you@example.com"
+  DCC_CLIENT_PASSWD: "…"          # or DCC_IDS: <path to a DCC ids file>
+  # DCC_SERVERS: "dcc1.dcc-servers.net,dcc2.dcc-servers.net"  # override the pool
+  RAZOR_USER: "you@example.com"   # obtain one with `gozer razor-register`
   RAZOR_PASS: "…"
   PYZOR_SERVERS: "public.pyzor.org:24441"
 ```
@@ -235,35 +231,32 @@ In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo
 is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 `docker buildx bake debian-rspamd-drp`.
 
-> **Packages:** only `dcc` is installed at runtime — Razor and Pyzor are linked
-> in via gazor/gyzor, so there is no perl or python in the image. `dcc` comes from
-> our own Debian package on [deb.myguard.nl](https://deb.myguard.nl) (the apt repo
-> and signing key are already in `eilandert/debian-base`); DCC isn't in Debian
-> proper for licence reasons. The backend uses `dccproc` (and `cdcc` at bootstrap);
-> the `dccifd` daemon the package also ships is not run.
+> **Packages:** none. The runtime is `distroless/static` plus the single static
+> `gozer` binary — no Debian, no apt, no perl/python, no `dcc` package
+> (dccproc/cdcc), no shell. All three clients are linked in.
 
-## The Go rewrite: gazor, gyzor, gozer
+## The Go rewrite: gazor, gyzor, gdcc, gozer
 
 Earlier versions of this backend were a thin Python HTTP shim that, for every
-message, forked the perl `razor-check` / `razor-report` and the python `pyzor`
-CLIs (alongside `dccproc`). That meant an interpreter start per check and a
-perl + python toolchain baked into the image. The two clients were rewritten
-from scratch in Go and are now linked into the backend in-process:
+message, forked the perl `razor-check` / `razor-report`, the python `pyzor` and
+the `dccproc` CLIs. That meant an interpreter (and a set-UID `dccproc`) start
+per check and a perl + python + dcc toolchain baked into the image. All three
+clients were rewritten from scratch in Go and are now linked into the backend
+in-process:
 
 | Was (per-message fork) | Now (in-process Go) | What it is |
 |------------------------|---------------------|------------|
 | perl `razor-agents` (Razor2) | [gazor](https://github.com/eilandert/gazor) | Go razor client |
 | python `pyzor` | [gyzor](https://github.com/eilandert/gyzor) | Go pyzor client |
+| set-UID `dccproc` (dcc package) | [gdcc](https://github.com/eilandert/gdcc) | Go DCC client |
 | python `spamcheck_shim.py` | **gozer** | this backend — the binary in the image |
 
-DCC has no Go client, so it is still run as a `dccproc` fork — the only
-per-message process left.
-
-gazor and gyzor speak their wire protocols byte-for-byte compatibly with the
-reference perl/python clients (each is gated by parity tests against real razor
-and pyzor in its own CI), so the servers see identical fingerprints and the
-switch is invisible on the wire. Dropping the perl and python runtimes took the
-image from roughly 268 MB to 176 MB, and a check no longer forks an interpreter.
+gazor, gyzor and gdcc speak their wire protocols byte-for-byte compatibly with
+the reference perl/python/C clients (each is gated by parity tests against real
+razor, pyzor and `dccproc` in its own CI), so the servers see identical
+fingerprints and the switch is invisible on the wire. With **no per-message fork
+left**, the image dropped from ~268 MB (perl/python/dcc + s6 on Debian) to a
+**~19 MB distroless static binary**.
 
 Upgrading from an older build: the backend's environment variables were renamed
 `SHIM_*` to `GOZER_*` (for example `SHIM_TOKEN` becomes `GOZER_TOKEN`). The HTTP

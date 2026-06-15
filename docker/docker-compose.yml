@@ -47,25 +47,25 @@ services:
     secrets:
       - drp_token
 
-    volumes:
-      - drp-razor:/var/lib/razor
-      - drp-pyzor:/var/lib/pyzor
+    # No volumes: the image carries no writable state. gozer reads all config
+    # from the environment; supply RAZOR_USER/RAZOR_PASS (or _FILE) for /report.
 
     # --- Hardening ---------------------------------------------------------
-    read_only: true                 # immutable rootfs; only the mounts + tmpfs writable
+    read_only: true                 # immutable rootfs (distroless, nonroot)
     tmpfs:
-      - /run:exec,mode=0755         # s6 runtime (exec: s6 runs its helpers)
-      - /tmp:mode=1777
+      - /tmp:mode=1777              # scratch only; gozer writes nothing to disk
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
 
+    # The image already defines a HEALTHCHECK (`gozer health`, no shell/curl);
+    # this override just mirrors it for clarity.
     healthcheck:
-      test: ["CMD", "/healthcheck.sh"]
+      test: ["CMD", "/usr/local/bin/gozer", "health"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      start_period: 10s
       retries: 3
 
 networks:
@@ -73,10 +73,6 @@ networks:
     # Attach your rspamd/dovecot stack to this same network (external: true if
     # it already exists elsewhere).
     driver: bridge
-
-volumes:
-  drp-razor:
-  drp-pyzor:
 
 secrets:
   drp_token:
