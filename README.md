@@ -180,6 +180,40 @@ de-prefixed and hyphenated — e.g. `GOZER_MAX_CONCURRENT` ↔ `--max-concurrent
 | `DCC_SERVERS` / `GYZOR_SERVERS` / `GAZOR_DISCOVERY` | — | DNS-bypass server overrides forwarded to gdcc / gyzor / gazor (see above). |
 | `TZ` | — | Container timezone. |
 
+## Benchmarks
+
+From `go test -bench` (Go 1.26, 32-core host); reproduce with the commands shown.
+
+**Request path / throughput** — `go test -bench BenchmarkServe ./internal/gozer`
+drives the full server (auth, concurrency gate, cache, single-flight, dispatch)
+against a 2&nbsp;ms synthetic backend, over a mixed cache-hit ratio:
+
+| cache hit ratio | throughput | backend calls / request |
+|-----------------|-----------:|------------------------:|
+| 90 % | ~29,600 msg/s | 0.11 |
+| 50 % | ~11,500 msg/s | 0.53 |
+| 0 % (all miss) | ~11,800 msg/s | 1.01 |
+
+The verdict cache is the lever: at a 90 % hit ratio only ~1 request in 9 reaches
+a backend, and gozer clears 1000 msg/s comfortably even all-miss. The in-process
+cache hit itself is **~55 ns, zero allocations**; an at-capacity LRU insert is
+~344 ns.
+
+**Fingerprint compute** (offline, one 256 KiB message) — the in-process CPU cost
+per network, all dwarfed by network RTT:
+
+| client | per message | allocations |
+|--------|------------:|------------:|
+| gdcc — DCC checksums | ~3.2 ms (81 MB/s) | 24 |
+| gyzor — Pyzor digest | ~4.5 ms (58 MB/s) | 50 |
+| gazor — Razor signatures | ~8.4 ms (31 MB/s) | 833 |
+
+**Network round-trips dominate the cold path** (anonymous, public servers,
+varies with distance): Pyzor ~50 ms, DCC ~170 ms, Razor ~1 s (multi-step
+discovery handshake). gozer queries all three **concurrently, in-process**, so a
+cold `/check` ≈ the slowest backend (Razor), not the sum — and a cached `/check`
+is a sub-millisecond local lookup.
+
 ## HTTP API
 
 The request body is always the raw RFC-822 message. POST endpoints require the
