@@ -133,10 +133,18 @@ environment:
 ```
 
 The `gozer *-register` subcommands persist a credential to the file the matching
-network loads it from **and** print it as bare `KEY=value` env lines (e.g.
-`gozer pyzor-register --user alice | grep '^GYZOR_' > pyzor.env`), so you can feed
-it back through the environment instead of mounting a file. See the
-[gozer README](https://github.com/eilandert/gozer#registering-identities).
+network loads it from **and** print it as bare `KEY=value` env lines, so you can
+feed it back through the environment instead of mounting a file. The image
+entrypoint is `gozer serve`, so override it to run a register subcommand:
+
+```bash
+docker compose run --rm --entrypoint /usr/local/bin/gozer rspamd-drp \
+  pyzor-register --user you@example.com | grep '^GYZOR_' > pyzor.env
+# likewise: razor-register --user … --pass …   |   dcc-register --client-id … --passwd …
+```
+
+See the [gozer README](https://github.com/eilandert/gozer#registering-identities)
+for all the flags.
 
 **Pyzor authentication.** Unlike Razor and DCC, Pyzor has no credential env var —
 the in-process gyzor client loads accounts the reference-pyzor way, from an
