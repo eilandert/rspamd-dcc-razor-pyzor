@@ -1,23 +1,23 @@
 # rspamd-dcc-razor-pyzor
 
-A small, standalone Docker backend that brings the three classic
-collaborative-filtering networks — **DCC**, **Razor** and **Pyzor** — to
-[rspamd](https://rspamd.com) through a single HTTP endpoint, plus the rspamd
-plugin that talks to it.
+> A small, standalone Docker backend that brings the three classic
+> collaborative-filtering networks — **DCC**, **Razor** and **Pyzor** — to
+> [rspamd](https://rspamd.com) through one HTTP endpoint, plus the rspamd plugin
+> that talks to it.
 
 The image runs **no rspamd of its own**. Your rspamd stays in its own container
 (or on the host); you drop the plugin shipped here into it and point the plugin
 at this backend.
 
 **Why a separate backend?** rspamd has a built-in DCC module but nothing for
-Razor or Pyzor, and shelling out to those CLIs from inside the rspamd worker
-would block its event loop. This service is a single static Go binary that
-speaks **all three networks in-process** — Razor, Pyzor and DCC via the
+Razor or Pyzor, and shelling out to those CLIs from inside the rspamd worker would
+block its event loop. This service is a single static Go binary that speaks **all
+three networks in-process** — Razor, Pyzor and DCC via the
 [gazor](https://github.com/eilandert/gazor),
 [gyzor](https://github.com/eilandert/gyzor) and
-[gdcc](https://github.com/eilandert/gdcc) libraries — answering over HTTP, so
-the plugin stays fully asynchronous and a single request covers all three
-networks at once, with **no per-message subprocess forks at all**.
+[gdcc](https://github.com/eilandert/gdcc) libraries — answering over HTTP, so the
+plugin stays fully asynchronous, one request covers all three networks at once,
+and there are **no per-message subprocess forks at all**.
 
 ## How it works
 
@@ -31,28 +31,27 @@ networks at once, with **no per-message subprocess forks at all**.
 ```
 
 The image is a single ~6 MB static `gozer` binary on a `distroless/static`
-base — no Debian, no s6 supervisor, no shell, no per-message fork. `gozer` is
-the container entrypoint and runs as `nonroot`. Its source lives in its own
-repo, [eilandert/gozer](https://github.com/eilandert/gozer), pulled in here as
-the `docker/gozer` submodule and compiled by this repo's image build. It queries the three networks
-**concurrently**, all in-process, and caches verdicts (see
-[Configuration](#configuration)). All three talk to their servers directly
-(DCC needs no `dccifd` daemon). Every backend is **best-effort**: if one network
-is unreachable it simply doesn't score, and the container stays healthy — the
-healthcheck only depends on gozer's `/health` (probed by `gozer health`, since
-the image ships no shell or curl).
+base — no Debian, no s6 supervisor, no shell, no per-message fork. `gozer` is the
+container entrypoint and runs as `nonroot`. Its source lives in its own repo,
+[eilandert/gozer](https://github.com/eilandert/gozer), pulled in here as the
+`docker/gozer` submodule and compiled by this repo's image build. It queries the
+three networks **concurrently**, all in-process, and caches verdicts (see
+[Configuration](#configuration)). All three talk to their servers directly (DCC
+needs no `dccifd` daemon). Every backend is **best-effort**: if one network is
+unreachable it simply doesn't score, and the container stays healthy — the
+healthcheck only depends on gozer's `/health` (probed by `gozer health`, since the
+image ships no shell or curl).
 
 **Hardening:** gozer runs non-root with bounded concurrency, every POST is
-**token-authenticated**, and the bundled compose runs the container read-only
-with `cap_drop: ALL`, `no-new-privileges`, and no published host port.
+**token-authenticated**, and the bundled compose runs the container read-only with
+`cap_drop: ALL`, `no-new-privileges`, and no published host port.
 
 ### Privacy: the message never touches disk
 
-Gozer keeps the message in memory: all three checksums (Razor, Pyzor and DCC)
-are computed in-process — nothing is ever written to a temp file.
-The cache stores only `sha256(body) → verdict` (never the body itself), and the
-same goes for the optional Redis backend, so no message content is ever persisted
-locally.
+Gozer keeps the message in memory: all three checksums (Razor, Pyzor and DCC) are
+computed in-process — nothing is ever written to a temp file. The cache stores
+only `sha256(body) → verdict` (never the body itself), and the same goes for the
+optional Redis backend, so no message content is ever persisted locally.
 
 (This is also why a `tmpfs` overlay would do nothing for speed: there is no
 per-message disk write to accelerate. The latency is **network** round-trips to
@@ -60,15 +59,15 @@ the DCC/Razor/Pyzor servers.)
 
 The only thing that leaves the container is what collaborative filtering needs:
 **content fingerprints** — DCC checksums, Razor signatures, Pyzor digests — sent
-to those networks (and, on `/report`, a spam submission). The raw message is
-never uploaded.
+to those networks (and, on `/report`, a spam submission). The raw message is never
+uploaded.
 
 ## Quick start
 
 ### 1. Run the backend
 
-Gozer rejects every POST until a token is configured, and it isn't published
-to the host — so run it with compose:
+Gozer rejects every POST until a token is configured, and it isn't published to
+the host — so run it with compose:
 
 ```bash
 cd docker
@@ -81,8 +80,8 @@ Give your rspamd (and Dovecot) the same token.
 
 ### 2. Install the plugin into rspamd
 
-The plugin lives in [`rspamd/`](rspamd/) at the repo root (it is **not** baked
-into the backend image):
+The plugin lives in [`rspamd/`](rspamd/) at the repo root (it is **not** baked into
+the backend image):
 
 ```bash
 cp rspamd/plugins/dcc_razor_pyzor.lua  /etc/rspamd/plugins/
@@ -114,16 +113,16 @@ taste):
 ## Identities
 
 Anonymous works for every network and is the default. The image carries **no
-writable state**, so nothing persists between restarts unless you mount it. To
-use a **known or shared identity**, supply it as below — Razor and DCC take
+writable state**, so nothing persists between restarts unless you mount it. To use
+a **known or shared identity**, supply it as below — Razor and DCC take
 credentials from the environment (every var also accepts a `<VAR>_FILE` form for
 Docker secrets), Pyzor reads a standard `accounts` file:
 
 | Network | How to authenticate | Anonymous default |
 |---------|---------------------|-------------------|
 | Razor | `RAZOR_USER` + `RAZOR_PASS` (or `_FILE`); obtain one with `gozer razor-register` | yes |
-| DCC | `DCC_CLIENT_ID` + `DCC_CLIENT_PASSWD` (or `_FILE`), or `DCC_IDS` | yes (id 1) |
-| Pyzor | mount a pyzor **`accounts` file** at `$PYZOR_HOME/accounts` — see below | yes |
+| DCC | `DCC_CLIENT_ID` + `DCC_CLIENT_PASSWD` (or `_FILE`), or `DCC_IDS`; persist with `gozer dcc-register` | yes (id 1) |
+| Pyzor | mount a pyzor **`accounts` file** at `$PYZOR_HOME/accounts` — see below; generate with `gozer pyzor-register` | yes |
 
 ```yaml
 environment:
@@ -133,10 +132,16 @@ environment:
   RAZOR_PASS: "…"
 ```
 
+The `gozer *-register` subcommands persist a credential to the file the matching
+network loads it from **and** print it as bare `KEY=value` env lines (e.g.
+`gozer pyzor-register --user alice | grep '^GYZOR_' > pyzor.env`), so you can feed
+it back through the environment instead of mounting a file. See the
+[gozer README](https://github.com/eilandert/gozer#registering-identities).
+
 **Pyzor authentication.** Unlike Razor and DCC, Pyzor has no credential env var —
 the in-process gyzor client loads accounts the reference-pyzor way, from an
-`accounts` file in its home dir (`PYZOR_HOME`, default `/var/lib/pyzor`). Mount
-one read-only; this works even with the container's `read_only: true` rootfs:
+`accounts` file in its home dir (`PYZOR_HOME`, default `/var/lib/pyzor`). Mount one
+read-only; this works even with the container's `read_only: true` rootfs:
 
 ```yaml
 environment:
@@ -150,17 +155,17 @@ volumes:
 public.pyzor.org : 24441 : you@example.com : 0123abcd,4567ef89…
 ```
 
-Generate the `salt,key` value with the stock `pyzor` tool from your passphrase;
+Generate the `salt,key` with `gozer pyzor-register` (or the stock `pyzor` tool);
 gyzor consumes it byte-for-byte. With no accounts file the Pyzor client is
 anonymous to the public server, which suits most setups.
 
 ### DNS-bypass server overrides
 
-When the container's DNS is flaky or the public discovery servers are
-unreachable, each network's server list can be pinned explicitly, bypassing DNS
-discovery entirely. Gozer forwards these to the matching in-process client
-(`gdcc`, `gyzor`, `gazor`); each accepts a comma list of `host[:port]`
-(hostname, IPv4, or bracketed IPv6 `[::1]:port`):
+When the container's DNS is flaky or the public discovery servers are unreachable,
+pin each network's server list explicitly, bypassing DNS discovery entirely. Gozer
+forwards these to the matching in-process client (`gdcc`, `gyzor`, `gazor`); each
+accepts a comma list of `host[:port]` (hostname, IPv4, or bracketed IPv6
+`[::1]:port`):
 
 ```yaml
 environment:
@@ -183,9 +188,9 @@ Every setting is a backend-container **environment variable** and also a
 **`gozer serve` CLI flag** (flag > env > default), so the same option works in
 compose or on the command line. The flag name is the env name lower-cased,
 de-prefixed and hyphenated — e.g. `GOZER_MAX_CONCURRENT` ↔ `--max-concurrent`,
-`GYZOR_SERVERS` ↔ `--pyzor-servers`. The full env/flag table and HTTP API are
-documented in the [gozer README](https://github.com/eilandert/gozer#configuration);
-the compose-relevant subset is below.
+`GYZOR_SERVERS` ↔ `--pyzor-servers`. The full env/flag table and HTTP API are in
+the [gozer README](https://github.com/eilandert/gozer#configuration); the
+compose-relevant subset is below.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -217,8 +222,8 @@ against a 2&nbsp;ms synthetic backend, over a mixed cache-hit ratio:
 | 50 % | ~11,500 msg/s | 0.53 |
 | 0 % (all miss) | ~11,800 msg/s | 1.01 |
 
-The verdict cache is the lever: at a 90 % hit ratio only ~1 request in 9 reaches
-a backend, and gozer clears 1000 msg/s comfortably even all-miss. The in-process
+The verdict cache is the lever: at a 90 % hit ratio only ~1 request in 9 reaches a
+backend, and gozer clears 1000 msg/s comfortably even all-miss. The in-process
 cache hit itself is **~55 ns, zero allocations**; an at-capacity LRU insert is
 ~344 ns.
 
@@ -231,17 +236,17 @@ per network, all dwarfed by network RTT:
 | gyzor — Pyzor digest | ~4.5 ms (58 MB/s) | 50 |
 | gazor — Razor signatures | ~8.4 ms (31 MB/s) | 833 |
 
-**Network round-trips dominate the cold path** (anonymous, public servers,
-varies with distance): Pyzor ~50 ms, DCC ~170 ms, Razor ~1 s (multi-step
-discovery handshake). gozer queries all three **concurrently, in-process**, so a
-cold `/check` ≈ the slowest backend (Razor), not the sum — and a cached `/check`
-is a sub-millisecond local lookup.
+**Network round-trips dominate the cold path** (anonymous, public servers, varies
+with distance): Pyzor ~50 ms, DCC ~170 ms, Razor ~1 s (multi-step discovery
+handshake). gozer queries all three **concurrently, in-process**, so a cold
+`/check` ≈ the slowest backend (Razor), not the sum — and a cached `/check` is a
+sub-millisecond local lookup.
 
 ## HTTP API
 
 The request body is always the raw RFC-822 message. POST endpoints require the
-token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
-(`401` if it's wrong, `503` if gozer has no token). `/health` needs no auth.
+token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>` (`401` if
+it's wrong, `503` if gozer has no token). `/health` needs no auth.
 
 - **`POST /check`** — query only, never reports. Used by the rspamd plugin.
 
@@ -257,24 +262,24 @@ token, sent as `Authorization: Bearer <token>` or `X-DRP-Token: <token>`
   { "dcc": true, "razor": true, "pyzor": true }
   ```
 
-- **`POST /revoke`** — report as **ham**. Razor and Pyzor support this; DCC has
-  no network un-report, so its value is `null`.
+- **`POST /revoke`** — report as **ham**. Razor and Pyzor support this; DCC has no
+  network un-report, so its value is `null`.
 
 - **`GET /health`** — `200 ok`, used by the container healthcheck.
 
 - **`GET /metrics`** — Prometheus exposition (no auth): per-endpoint request
   counters (`gozer_check_total`, `gozer_report_total`, `gozer_revoke_total`),
-  `gozer_error_total`, `gozer_busy_total`, cache hit/miss/coalesced, Redis
-  health (`gozer_redis_error_total`, `gozer_redis_circuit_open_total`),
-  per-backend errors (`gozer_backend_error_total{backend="dcc|razor|pyzor"}`)
-  and a `gozer_latency_seconds` histogram. `gozer stats` fetches and prints it locally
+  `gozer_error_total`, `gozer_busy_total`, cache hit/miss/coalesced, Redis health
+  (`gozer_redis_error_total`, `gozer_redis_circuit_open_total`), per-backend errors
+  (`gozer_backend_error_total{backend="dcc|razor|pyzor"}`) and a
+  `gozer_latency_seconds` histogram. `gozer stats` fetches and prints it locally
   (the image ships no curl).
 
 ### Example
 
 POST the raw message as the body — `--data-binary` keeps the bytes intact (the
-fingerprints are computed over them). From a container on the same network (or
-the host if you published the port):
+fingerprints are computed over them). From a container on the same network (or the
+host if you published the port):
 
 ```sh
 TOKEN=$(cat docker/secrets/drp_token.txt)
@@ -292,10 +297,10 @@ curl -s http://rspamd-drp:8077/metrics      # no auth
 
 ## Reporting from Dovecot (sieve)
 
-`/check` is for scanning. `/report` and `/revoke` are for **user feedback** —
-when someone moves a message into Junk (spam) or rescues it back out (ham).
-Sieve can't speak HTTP, so [`dovecot/drp-report`](dovecot/drp-report) bridges the
-message to gozer, triggered by imapsieve.
+`/check` is for scanning. `/report` and `/revoke` are for **user feedback** — when
+someone moves a message into Junk (spam) or rescues it back out (ham). Sieve can't
+speak HTTP, so [`dovecot/drp-report`](dovecot/drp-report) bridges the message to
+gozer, triggered by imapsieve.
 
 The [`eilandert/dovecot`](https://github.com/eilandert/dockerized) image already
 bakes this in. To wire it into **any other** Dovecot host (needs `curl` and
@@ -323,8 +328,8 @@ What it does ([`90-drp-sieve.conf`](dovecot/90-drp-sieve.conf)):
 | move/copy **into** `Junk` | `report-spam.sieve` | `POST /report` (spam) |
 | move **out of** `Junk` | `report-ham.sieve` | `POST /revoke` (ham) |
 
-`drp-report` always exits 0, so a reporting hiccup never bounces mail or blocks
-the IMAP move.
+`drp-report` always exits 0, so a reporting hiccup never bounces mail or blocks the
+IMAP move.
 
 ## Build
 
@@ -332,8 +337,8 @@ the IMAP move.
 docker build -f docker/Dockerfile-deb -t eilandert/rspamd-dcc-razor-pyzor:latest docker/
 ```
 
-In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo
-is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
+In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo is
+a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 `docker buildx bake debian-rspamd-drp`.
 
 > **Packages:** none. The runtime is `distroless/static` plus the single static
@@ -343,11 +348,10 @@ is a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 ## The Go rewrite: gazor, gyzor, gdcc, gozer
 
 Earlier versions of this backend were a thin Python HTTP shim that, for every
-message, forked the perl `razor-check` / `razor-report`, the python `pyzor` and
-the `dccproc` CLIs. That meant an interpreter (and a set-UID `dccproc`) start
-per check and a perl + python + dcc toolchain baked into the image. All three
-clients were rewritten from scratch in Go and are now linked into the backend
-in-process:
+message, forked the perl `razor-check` / `razor-report`, the python `pyzor` and the
+`dccproc` CLIs. That meant an interpreter (and a set-UID `dccproc`) start per check
+and a perl + python + dcc toolchain baked into the image. All three clients were
+rewritten from scratch in Go and are now linked into the backend in-process:
 
 | Was (per-message fork) | Now (in-process Go) | What it is |
 |------------------------|---------------------|------------|
@@ -356,12 +360,12 @@ in-process:
 | set-UID `dccproc` (dcc package) | [gdcc](https://github.com/eilandert/gdcc) | Go DCC client |
 | python `spamcheck_shim.py` | **gozer** | this backend — the binary in the image |
 
-gazor, gyzor and gdcc speak their wire protocols byte-for-byte compatibly with
-the reference perl/python/C clients (each is gated by parity tests against real
-razor, pyzor and `dccproc` in its own CI), so the servers see identical
-fingerprints and the switch is invisible on the wire. With **no per-message fork
-left**, the image dropped from ~268 MB (perl/python/dcc + s6 on Debian) to a
-**~6 MB distroless static binary**.
+gazor, gyzor and gdcc speak their wire protocols byte-for-byte compatibly with the
+reference perl/python/C clients (each is gated by parity tests against real razor,
+pyzor and `dccproc` in its own CI), so the servers see identical fingerprints and
+the switch is invisible on the wire. With **no per-message fork left**, the image
+dropped from ~268 MB (perl/python/dcc + s6 on Debian) to a **~6 MB distroless
+static binary**.
 
 Upgrading from an older build: the backend's environment variables were renamed
 `SHIM_*` to `GOZER_*` (for example `SHIM_TOKEN` becomes `GOZER_TOKEN`). The HTTP
