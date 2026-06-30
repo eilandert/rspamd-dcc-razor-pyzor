@@ -34,9 +34,21 @@ local settings = {
   symbol_dcc = "DRP_DCC_BULK",
   symbol_razor = "DRP_RAZOR",
   symbol_pyzor = "DRP_PYZOR",
-  -- DCC "bulk" counter threshold above which we treat it as a hit. "many" maps
-  -- to a very large int by the shim, so this also catches the textual verdict.
+  -- DCC body-checksum count at/above which we treat it as a hit. Below this we
+  -- don't fire. DCC counts are NOT linear: a finite count is "this many clients
+  -- reported the body", but once a checksum is reported widely DCC stops
+  -- counting and pins it to the "many" sentinel (DCC_TGTS_TOO_MANY = 16777200),
+  -- which means ">= a lot, gave up counting" — could be 16M or 454B, unknown.
   dcc_bulk_threshold = 1000,
+  -- The "many" sentinel value gozer/gdcc reports for a flood-level checksum.
+  -- Anything at/above this is the strongest bulk signal and scores the ceiling.
+  dcc_many = 16777200,
+  -- Confidence glides logarithmically with the count between the threshold and
+  -- "many" (10 vs 20 reports ~ same; 1k vs 1M is a real difference), mapped onto
+  -- [dcc_score_min, 1.0] as the insert_result multiplier. Effective score is
+  -- group_weight * multiplier, so a barely-over hit nudges and "many" hits the
+  -- group ceiling. Floor keeps a borderline hit visible without over-biting.
+  dcc_score_min = 0.15,
   -- Pyzor: report count at/above this many sightings is a hit (unless the
   -- whitelist count is non-zero).
   pyzor_count_threshold = 5,
@@ -56,12 +68,24 @@ local function parse_response(task, body)
     return
   end
 
-  -- DCC
+  -- DCC. Fire when the backend rejects or the body count clears the threshold.
+  -- The multiplier glides log10(count) over [threshold, many] → [score_min, 1.0]
+  -- so the effective score (group_weight * mult) tracks how widely the body was
+  -- reported instead of a flat hit; the "many" sentinel pins to the ceiling.
   if res.dcc then
     local d = res.dcc
     local bulk = tonumber(d.bulk)
     if d.action == "reject" or (bulk and bulk >= settings.dcc_bulk_threshold) then
-      task:insert_result(settings.symbol_dcc, 1.0,
+      local mult = 1.0
+      if bulk and bulk < settings.dcc_many then
+        local lo = math.log(settings.dcc_bulk_threshold)
+        local hi = math.log(settings.dcc_many)
+        local frac = (math.log(bulk) - lo) / (hi - lo)
+        mult = settings.dcc_score_min + frac * (1.0 - settings.dcc_score_min)
+        if mult < settings.dcc_score_min then mult = settings.dcc_score_min end
+        if mult > 1.0 then mult = 1.0 end
+      end
+      task:insert_result(settings.symbol_dcc, mult,
         string.format("bulk=%s", tostring(d.bulk or d.action)))
     end
   end
