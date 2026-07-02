@@ -16,7 +16,7 @@ ARG GO_VERSION=1.24
 # --- build stage: compile the static gozer binary (fully offline: deps are
 # vendored, so no module proxy / git fetch is needed) ---------------------------
 # gozer source comes from the docker/gozer submodule (its own repo,
-# github.com/eilandert/gozer). Build context is docker/, so it sits at gozer/.
+# github.com/myguard-labs/gozer). Build context is docker/, so it sits at gozer/.
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 COPY gozer/go.mod gozer/go.sum ./
@@ -34,7 +34,7 @@ RUN CGO_ENABLED=0 go build -mod=vendor -trimpath \
 # handshakes; DCC is plain UDP). No Debian base, no s6, no apt, no shell.
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.authors="eilandert"
-LABEL org.opencontainers.image.source="https://github.com/eilandert/rspamd-dcc-razor-pyzor"
+LABEL org.opencontainers.image.source="https://github.com/myguard-labs/rspamd-dcc-razor-pyzor"
 LABEL maintainer="Thijs Eilander <eilander@myguard.nl>"
 
 # gozer reads ALL config from the environment (GOZER_*, DCC_*, RAZOR_*, PYZOR_*).

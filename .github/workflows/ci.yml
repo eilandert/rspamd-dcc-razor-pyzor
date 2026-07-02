@@ -1,5 +1,5 @@
 name: ci
-# The Go backend (gozer) has moved to its own repo, github.com/eilandert/gozer,
+# The Go backend (gozer) has moved to its own repo, github.com/myguard-labs/gozer,
 # and is built/vetted/tested by that repo's CI. It is pulled in here as the
 # docker/gozer submodule. This workflow covers only what this repo owns: the
 # rspamd lua plugin. The full image build + HTTP smoke test lives in

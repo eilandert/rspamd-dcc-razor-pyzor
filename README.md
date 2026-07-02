@@ -13,9 +13,9 @@ at this backend.
 Razor or Pyzor, and shelling out to those CLIs from inside the rspamd worker would
 block its event loop. This service is a single static Go binary that speaks **all
 three networks in-process** — Razor, Pyzor and DCC via the
-[gazor](https://github.com/eilandert/gazor),
-[gyzor](https://github.com/eilandert/gyzor) and
-[gdcc](https://github.com/eilandert/gdcc) libraries — answering over HTTP, so the
+[gazor](https://github.com/myguard-labs/gazor),
+[gyzor](https://github.com/myguard-labs/gyzor) and
+[gdcc](https://github.com/myguard-labs/gdcc) libraries — answering over HTTP, so the
 plugin stays fully asynchronous, one request covers all three networks at once,
 and there are **no per-message subprocess forks at all**.
 
@@ -33,7 +33,7 @@ and there are **no per-message subprocess forks at all**.
 The image is a single ~6 MB static `gozer` binary on a `distroless/static`
 base — no Debian, no s6 supervisor, no shell, no per-message fork. `gozer` is the
 container entrypoint and runs as `nonroot`. Its source lives in its own repo,
-[eilandert/gozer](https://github.com/eilandert/gozer), pulled in here as the
+[eilandert/gozer](https://github.com/myguard-labs/gozer), pulled in here as the
 `docker/gozer` submodule and compiled by this repo's image build. It queries the
 three networks **concurrently**, all in-process, and caches verdicts (see
 [Configuration](#configuration)). All three talk to their servers directly (DCC
@@ -143,7 +143,7 @@ docker compose run --rm --entrypoint /usr/local/bin/gozer rspamd-drp \
 # likewise: razor-register --user … --pass …   |   dcc-register --client-id … --passwd …
 ```
 
-See the [gozer README](https://github.com/eilandert/gozer#registering-identities)
+See the [gozer README](https://github.com/myguard-labs/gozer#registering-identities)
 for all the flags.
 
 **Pyzor authentication.** Unlike Razor and DCC, Pyzor has no credential env var —
@@ -197,7 +197,7 @@ Every setting is a backend-container **environment variable** and also a
 compose or on the command line. The flag name is the env name lower-cased,
 de-prefixed and hyphenated — e.g. `GOZER_MAX_CONCURRENT` ↔ `--max-concurrent`,
 `GYZOR_SERVERS` ↔ `--pyzor-servers`. The full env/flag table and HTTP API are in
-the [gozer README](https://github.com/eilandert/gozer#configuration); the
+the [gozer README](https://github.com/myguard-labs/gozer#configuration); the
 compose-relevant subset is below.
 
 | Variable | Default | Purpose |
@@ -363,9 +363,9 @@ rewritten from scratch in Go and are now linked into the backend in-process:
 
 | Was (per-message fork) | Now (in-process Go) | What it is |
 |------------------------|---------------------|------------|
-| perl `razor-agents` (Razor2) | [gazor](https://github.com/eilandert/gazor) | Go razor client |
-| python `pyzor` | [gyzor](https://github.com/eilandert/gyzor) | Go pyzor client |
-| set-UID `dccproc` (dcc package) | [gdcc](https://github.com/eilandert/gdcc) | Go DCC client |
+| perl `razor-agents` (Razor2) | [gazor](https://github.com/myguard-labs/gazor) | Go razor client |
+| python `pyzor` | [gyzor](https://github.com/myguard-labs/gyzor) | Go pyzor client |
+| set-UID `dccproc` (dcc package) | [gdcc](https://github.com/myguard-labs/gdcc) | Go DCC client |
 | python `spamcheck_shim.py` | **gozer** | this backend — the binary in the image |
 
 gazor, gyzor and gdcc speak their wire protocols byte-for-byte compatibly with the
@@ -385,10 +385,10 @@ unchanged.
 - Docker Hub: <https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor>
 - Monorepo: <https://github.com/eilandert/dockerized>
 - Article: <https://deb.myguard.nl/2026/06/rspamd-dcc-razor-pyzor-docker-backend/>
-- gozer (the backend binary — its own repo, here as the `docker/gozer` submodule): <https://github.com/eilandert/gozer>
-- gazor (Razor client, imported in-process): <https://github.com/eilandert/gazor>
-- gyzor (Pyzor client, imported in-process): <https://github.com/eilandert/gyzor>
-- gdcc (DCC client, imported in-process): <https://github.com/eilandert/gdcc>
+- gozer (the backend binary — its own repo, here as the `docker/gozer` submodule): <https://github.com/myguard-labs/gozer>
+- gazor (Razor client, imported in-process): <https://github.com/myguard-labs/gazor>
+- gyzor (Pyzor client, imported in-process): <https://github.com/myguard-labs/gyzor>
+- gdcc (DCC client, imported in-process): <https://github.com/myguard-labs/gdcc>
 
 ## License
 
