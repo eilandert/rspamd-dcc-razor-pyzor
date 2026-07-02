@@ -310,7 +310,7 @@ someone moves a message into Junk (spam) or rescues it back out (ham). Sieve can
 speak HTTP, so [`dovecot/drp-report`](dovecot/drp-report) bridges the message to
 gozer, triggered by imapsieve.
 
-The [`eilandert/dovecot`](https://github.com/eilandert/dockerized) image already
+The [`eilandert/dovecot`](https://github.com/myguard-labs/dockerized) image already
 bakes this in. To wire it into **any other** Dovecot host (needs `curl` and
 `dovecot-sieve`):
 
@@ -345,7 +345,7 @@ IMAP move.
 docker build -f docker/Dockerfile-deb -t eilandert/rspamd-dcc-razor-pyzor:latest docker/
 ```
 
-In the [dockerized](https://github.com/eilandert/dockerized) monorepo this repo is
+In the [dockerized](https://github.com/myguard-labs/dockerized) monorepo this repo is
 a submodule at `src/rspamd-dcc-razor-pyzor`; build it with
 `docker buildx bake debian-rspamd-drp`.
 
@@ -383,7 +383,7 @@ unchanged.
 ## See also
 
 - Docker Hub: <https://hub.docker.com/r/eilandert/rspamd-dcc-razor-pyzor>
-- Monorepo: <https://github.com/eilandert/dockerized>
+- Monorepo: <https://github.com/myguard-labs/dockerized>
 - Article: <https://deb.myguard.nl/2026/06/rspamd-dcc-razor-pyzor-docker-backend/>
 - gozer (the backend binary — its own repo, here as the `docker/gozer` submodule): <https://github.com/myguard-labs/gozer>
 - gazor (Razor client, imported in-process): <https://github.com/myguard-labs/gazor>
